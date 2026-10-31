@@ -50,7 +50,7 @@ button{cursor:pointer;background:none;border:0}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 0 rgba(52,211,153,.6);animation:ping 2s infinite;flex-shrink:0}
 .pill.off .dot{background:var(--err);animation:none}
 @keyframes ping{70%{box-shadow:0 0 0 7px rgba(52,211,153,0)}100%{box-shadow:0 0 0 0 rgba(52,211,153,0)}}
-.tabbar{position:fixed;left:0;right:0;bottom:0;z-index:30;display:grid;grid-template-columns:repeat(4,1fr);padding:6px 8px;padding-bottom:max(6px,env(safe-area-inset-bottom));min-height:var(--tab-h);background:rgba(8,9,20,.9);backdrop-filter:blur(18px);border-top:1px solid var(--line)}
+.tabbar{position:fixed;left:0;right:0;bottom:0;z-index:30;display:grid;grid-template-columns:repeat(5,1fr);padding:6px 8px;padding-bottom:max(6px,env(safe-area-inset-bottom));min-height:var(--tab-h);background:rgba(8,9,20,.9);backdrop-filter:blur(18px);border-top:1px solid var(--line)}
 .tabbar[hidden]{display:none}
 .tab{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:6px 2px;border-radius:12px;color:var(--dim);font-size:10.5px;font-weight:600;transition:var(--ease)}
 .tab i{font-size:17px}.tab.team i{color:var(--ok)}
@@ -94,6 +94,18 @@ button{cursor:pointer;background:none;border:0}
 .seg button:hover{color:#fff}.seg button.active{color:#fff;background:var(--grad);box-shadow:0 6px 16px rgba(99,102,241,.4);transition:background 1s ease}
 .seg .n{font-style:normal;font-family:'JetBrains Mono',monospace;font-size:11px;padding:1px 6px;border-radius:6px;background:rgba(255,255,255,.1)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,340px),1fr));gap:14px}
+.team-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,340px),1fr));gap:14px}
+.team-card{padding:18px;overflow:hidden}
+.team-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.team-card-title{font-weight:800;font-size:15px;overflow-wrap:anywhere}
+.team-card-meta{color:var(--dim);font-size:12px;margin-top:5px;overflow-wrap:anywhere}
+.team-members{display:grid;gap:9px;margin-top:14px}
+.team-member{padding:11px;border-radius:11px;border:1px solid var(--line);background:rgba(255,255,255,.025);min-width:0}
+.team-member-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+.team-member-name{font-weight:700;font-size:13px;overflow-wrap:anywhere}
+.team-member-uid{color:var(--dim);font-family:'JetBrains Mono',monospace;font-size:11px;margin-top:3px;overflow-wrap:anywhere}
+.team-member-status{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.team-note{color:var(--dim);font-size:12px;margin-top:12px;line-height:1.5}
 .node{padding:18px;overflow:hidden}.node:hover{transform:translateY(-2px)}
 .node-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:16px}
 .who{display:flex;align-items:center;gap:13px;min-width:0}
@@ -177,6 +189,7 @@ button{cursor:pointer;background:none;border:0}
     <nav class="nav">
       <button class="nav-item active" data-page="core" data-title="Command Core"><i class="fa-solid fa-gauge-high"></i>Command Core</button>
       <button class="nav-item" data-page="targets" data-title="Accounts"><i class="fa-solid fa-network-wired"></i>Accounts</button>
+      <button class="nav-item" data-page="teams" data-title="Teams"><i class="fa-solid fa-people-group"></i>Teams</button>
       <button class="nav-item" data-page="terminal" data-title="Live Console"><i class="fa-solid fa-terminal"></i>Live Console</button>
       <button class="nav-item team" data-open="teamModal"><i class="fa-solid fa-users-gear"></i>Create Team</button>
     </nav>
@@ -240,6 +253,24 @@ button{cursor:pointer;background:none;border:0}
         <div class="empty" id="noMatch" hidden><i class="fa-solid fa-filter-circle-xmark big"></i>No matching accounts.</div>
       </section>
 
+      <section id="page-teams" class="page">
+        <div class="page-head">
+          <div><h1 class="page-title">Teams</h1><p class="page-sub">Created groups, member accounts, and clan join-request status.</p></div>
+          <div class="row">
+            <button class="btn" id="refreshTeams"><i class="fa-solid fa-rotate"></i>Refresh</button>
+            <button class="btn ok" data-open="teamModal"><i class="fa-solid fa-users-gear"></i>Create Team</button>
+          </div>
+        </div>
+        <div class="stats team-stats">
+          <div class="stat glow"><div class="stat-top"><div class="stat-icon"><i class="fa-solid fa-people-group"></i></div><div class="stat-label">Team groups</div></div><div class="stat-val" id="teamsCount">0</div><div class="stat-foot">Created and existing clan groups</div></div>
+          <div class="stat glow"><div class="stat-top"><div class="stat-icon"><i class="fa-solid fa-users"></i></div><div class="stat-label">Accounts in teams</div></div><div class="stat-val" id="teamMembersCount">0</div><div class="stat-foot">Members listed below</div></div>
+          <div class="stat glow"><div class="stat-top"><div class="stat-icon"><i class="fa-solid fa-shield-halved"></i></div><div class="stat-label">Clan requests accepted</div></div><div class="stat-val" id="teamClanAccepted">0</div><div class="stat-foot">HTTP accepted; membership not independently verified</div></div>
+        </div>
+        <p class="team-note">This page only reports saved team data and the result of the existing clan join request. It does not start matches or select a game mode. Older teams may appear as clan groups if their original team boundaries were not saved.</p>
+        <div class="empty" id="teamsEmpty"><i class="fa-solid fa-people-group big"></i>Loading teams...</div>
+        <div class="team-grid" id="teamsList" hidden></div>
+      </section>
+
       <section id="page-terminal" class="page">
         <div class="page-head">
           <div><h1 class="page-title">Live Console</h1><p class="page-sub">Live backend execution logs</p></div>
@@ -263,6 +294,7 @@ button{cursor:pointer;background:none;border:0}
 <nav class="tabbar" id="tabbar">
   <button class="tab active" data-page="core" data-title="Command Core"><i class="fa-solid fa-gauge-high"></i>Core</button>
   <button class="tab" data-page="targets" data-title="Accounts"><i class="fa-solid fa-network-wired"></i>Accounts</button>
+  <button class="tab" data-page="teams" data-title="Teams"><i class="fa-solid fa-people-group"></i>Teams</button>
   <button class="tab" data-page="terminal" data-title="Live Console"><i class="fa-solid fa-terminal"></i>Console</button>
   <button class="tab team" data-open="teamModal"><i class="fa-solid fa-users-gear"></i>Team</button>
 </nav>
@@ -386,7 +418,9 @@ $("confirmNo").addEventListener("click", () => closeModal("confirmModal"));
 $("confirmYes").addEventListener("click", () => { if(confirmRes){ const r = confirmRes; confirmRes = null; r(true); } closeModal("confirmModal"); });
 
 /* ---------- navigation ---------- */
-const PAGES = ["core","targets","terminal"];
+const PAGES = ["core","targets","teams","terminal"];
+let teamsBusy = false;
+let teamsLoaded = false;
 function go(page){
   if(!PAGES.includes(page)) page = "core";
   document.querySelectorAll(".page").forEach(p => p.classList.toggle("active", p.id === "page-" + page));
@@ -865,6 +899,130 @@ async function fetchStats(manual){
     const c = $("connecting"); if(c && !state.loaded) c.innerHTML = '<i class="fa-solid fa-plug-circle-xmark big"></i>Cannot reach backend API';
   }finally{ inflight = false; setTimeout(() => ic.classList.remove("spin"), 400); }
 }
+
+function teamBadge(label, cls){
+  const el = document.createElement("span");
+  el.className = "badge " + (cls || "s-paused");
+  el.textContent = label;
+  return el;
+}
+function teamRuntimeState(value){
+  const state = String(value || "OFFLINE").toUpperCase();
+  if(state === "ONLINE") return ["Online", "s-online"];
+  if(state === "IN_MATCH") return ["In match", "s-match"];
+  if(state === "SEARCHING") return ["Searching", "s-search"];
+  if(state === "PAUSED") return ["Paused", "s-paused"];
+  if(state === "ERROR") return ["Error", "s-error"];
+  return ["Offline", "s-paused"];
+}
+function teamClanState(value){
+  const state = String(value || "unknown").toLowerCase();
+  if(state === "request_accepted") return ["Request accepted · membership unverified", "s-online"];
+  if(state === "failed") return ["Join request failed", "s-error"];
+  if(state === "pending") return ["Request pending", "s-search"];
+  return ["Not recorded", "s-paused"];
+}
+function renderTeams(payload){
+  const teams = Array.isArray(payload?.teams) ? payload.teams : [];
+  const list = $("teamsList"), empty = $("teamsEmpty");
+  list.replaceChildren();
+  teamsLoaded = true;
+  let memberCount = 0, acceptedCount = 0;
+  for(const team of teams){
+    const members = Array.isArray(team.members) ? team.members : [];
+    memberCount += members.length;
+    acceptedCount += members.filter(m => m && m.clan_status === "request_accepted").length;
+    const card = document.createElement("article"); card.className = "glow team-card";
+    const head = document.createElement("div"); head.className = "team-card-head";
+    const titleBox = document.createElement("div");
+    const title = document.createElement("div"); title.className = "team-card-title";
+    const teamId = String(team.id || "");
+    title.textContent = team.legacy ? "Existing clan group" : "Team " + (teamId ? teamId.slice(0, 8) : "");
+    const meta = document.createElement("div"); meta.className = "team-card-meta";
+    const region = String(team.region || "—"), clanId = String(team.clan_id || "—");
+    const expected = Number(team.expected_count) > 0 ? " · " + members.length + "/" + Number(team.expected_count) + " accounts" : " · " + members.length + " accounts";
+    meta.textContent = "Region " + region + " · Clan " + clanId + expected;
+    titleBox.append(title, meta);
+    const statusLabels = {creating:"Creating", created:"Created", partial:"Partial", failed:"Failed", legacy:"Existing group"};
+    const status = String(team.status || (team.legacy ? "legacy" : "unknown")).toLowerCase();
+    const statusClass = status === "created" ? "s-online" : status === "creating" ? "s-search" : status === "failed" ? "s-error" : "s-paused";
+    head.append(titleBox, teamBadge(statusLabels[status] || "Unknown", statusClass));
+    card.append(head);
+    if(team.created_at){
+      const time = document.createElement("div"); time.className = "team-card-meta";
+      const parsed = new Date(team.created_at);
+      time.textContent = "Created " + (Number.isNaN(parsed.getTime()) ? String(team.created_at) : parsed.toLocaleString());
+      card.append(time);
+    }
+    const rows = document.createElement("div"); rows.className = "team-members";
+    if(!members.length){
+      const note = document.createElement("div"); note.className = "team-note";
+      note.textContent = status === "creating" ? "Accounts are still being created." : "No account members are recorded for this group.";
+      rows.append(note);
+    }
+    for(const member of members){
+      if(!member || typeof member !== "object") continue;
+      const row = document.createElement("div"); row.className = "team-member";
+      const rowHead = document.createElement("div"); rowHead.className = "team-member-head";
+      const identity = document.createElement("div");
+      const name = document.createElement("div"); name.className = "team-member-name";
+      name.textContent = String(member.nickname || "Account");
+      const uid = document.createElement("div"); uid.className = "team-member-uid";
+      uid.textContent = "UID: " + String(member.uid || "—");
+      identity.append(name, uid);
+      const runtime = teamRuntimeState(member.status);
+      rowHead.append(identity, teamBadge(runtime[0], runtime[1]));
+      const tags = document.createElement("div"); tags.className = "team-member-status";
+      const clan = teamClanState(member.clan_status);
+      tags.append(teamBadge("Clan: " + clan[0], clan[1]));
+      row.append(rowHead, tags); rows.append(row);
+    }
+    card.append(rows);
+    if(team.legacy){
+      const note = document.createElement("div"); note.className = "team-note";
+      note.textContent = "This group is inferred from saved region and clan ID; its original team boundary and join result were not stored.";
+      card.append(note);
+    }
+    list.append(card);
+  }
+  $("teamsCount").textContent = String(teams.length);
+  $("teamMembersCount").textContent = String(memberCount);
+  $("teamClanAccepted").textContent = String(acceptedCount);
+  list.hidden = teams.length === 0;
+  empty.hidden = teams.length !== 0;
+  if(!teams.length){
+    empty.replaceChildren();
+    const icon = document.createElement("i"); icon.className = "fa-solid fa-people-group big";
+    empty.append(icon, document.createTextNode(teamsLoaded ? "No team groups found. Use Create Team to add one." : "Loading teams..."));
+  }
+  teamsLoaded = true;
+}
+async function fetchTeams(manual){
+  if(teamsBusy) return;
+  teamsBusy = true;
+  const button = $("refreshTeams"); if(button) button.disabled = true;
+  try{
+    const response = await apiFetch("/api/teams", {cache:"no-store"});
+    if(!response.ok) throw new Error("HTTP " + response.status);
+    renderTeams(await response.json());
+  }catch(error){
+    console.warn("Teams sync error:", error);
+    if(!teamsLoaded){
+      const empty = $("teamsEmpty"); empty.replaceChildren();
+      const icon = document.createElement("i"); icon.className = "fa-solid fa-plug-circle-xmark big";
+      empty.append(icon, document.createTextNode("Could not load teams. Check the connection and refresh."));
+      empty.hidden = false;
+    }
+    if(manual) toast("Could not load teams", "error");
+  }finally{
+    teamsBusy = false;
+    if(button) button.disabled = false;
+  }
+}
+document.querySelectorAll('[data-page="teams"]').forEach(button => button.addEventListener("click", () => fetchTeams()));
+$("refreshTeams").addEventListener("click", () => fetchTeams(true));
+setInterval(() => { if(!document.hidden && $("page-teams").classList.contains("active")) fetchTeams(); }, 15000);
+if(location.hash === "#teams") setTimeout(() => fetchTeams(), 0);
 $("syncBtn").addEventListener("click", () => fetchStats(true));
 
 /* ---------- utils ---------- */

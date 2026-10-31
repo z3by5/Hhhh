@@ -59,6 +59,7 @@ except Exception:
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 25567
 ACCOUNTS_FILE = "accounts.json"
+TEAMS_FILE = "teams.json"
 TOKEN_CACHE_FILE = "token_cache.json"
 DEVICES_FILE = "devices.json"
 TOKEN_CACHE_TTL = 1200
@@ -2538,6 +2539,27 @@ async def process_account_uid_pass(uid, password, region_override=None):
     except Exception as e:
         print_error(f"login err: {e}"); return None
 
+def _record_clan_request(uid, accepted):
+    """Update telemetry only; never issue or retry a clan request here."""
+    try:
+        teams = state_store.load_json("teams", TEAMS_FILE, []) or []
+        if not isinstance(teams, list):
+            return
+        changed = False
+        for team in teams:
+            if not isinstance(team, dict):
+                continue
+            for member in team.get("members", []):
+                if isinstance(member, dict) and str(member.get("uid")) == str(uid):
+                    status = "request_accepted" if accepted else "failed"
+                    if member.get("clan_status") != status:
+                        member["clan_status"] = status
+                        changed = True
+        if changed:
+            state_store.save_json("teams", TEAMS_FILE, teams)
+    except Exception:
+        pass
+
 async def run_account_worker(ad, label, region_override=None, clan_override=None):
     acc_id = str(ad['account_id'])
     info_task = None; exp_task = None
@@ -2552,8 +2574,11 @@ async def run_account_worker(ad, label, region_override=None, clan_override=None
         if clan_override:
             try:
                 await asyncio.sleep(1.0)
-                await join_clan(ad['token'], clan_override)
-            except Exception as e: print_warning(f"CLAN {e}")
+                accepted = await join_clan(ad['token'], clan_override)
+                _record_clan_request(label, bool(accepted))
+            except Exception:
+                _record_clan_request(label, False)
+                print_warning("CLAN request failed")
         info_task = asyncio.create_task(informational(
             ad['informational_addrs'], tcp_chat, ad['aes_ak'], ad['iv_i'],
             region=reg, account_id=acc_id, account_data=ad))
@@ -2679,7 +2704,7 @@ async def major_register(release_v, access_token, open_id, name, game_version,
     except Exception as e:
         print_error(f"MAJOR-REG {e}"); return None
 
-async def create_four_accounts(region: str, clan_id: str, count: int = 4, password: str = "RAFIN"):
+async def create_four_accounts(region: str, clan_id: str, count: int = 4, password: str = "RAFIN", team_id: Optional[str] = None):
     bot_state.creating = True
     bot_state.create_progress = []
     def _prog(s):
@@ -2786,12 +2811,13 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
                     'auth_type': 'guest', 'auth_uid': uid, 'auth_password': password,
                 }
                 _register_credentials(ad); cache_set(uid, ad)
+                if team_id:
+                    ad["team_id"] = team_id
                 created.append(ad)
                 _prog(f"bot {i+1}: {nickname_final} | UID {acc_id_raw} | region={region}")
                 await asyncio.sleep(0.6)
-            except Exception as e:
-                _prog(f"bot {i+1}: {e}")
-                traceback.print_exc()
+            except Exception:
+                _prog(f"bot {i+1}: creation failed")
         if created:
             try:
                 existing = state_store.load_json("accounts", ACCOUNTS_FILE, [])
@@ -2800,14 +2826,29 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
                 for a in created:
                     u = str(a['auth_uid'])
                     if u not in existing_uids:
-                        existing.append({"uid": u, "password": a['auth_password'],
-                                         "region": region, "clan_id": clan_id})
+                        record = {"uid": u, "password": a['auth_password'],
+                                  "region": region, "clan_id": clan_id}
+                        if team_id:
+                            record["team_id"] = team_id
+                        existing.append(record)
                 state_store.save_json("accounts", ACCOUNTS_FILE, existing)
                 _prog(f"{len(created)} accounts saved")
             except state_store.StoreError:
                 raise
-            except Exception as e:
-                _prog(f"save accounts: {e}")
+            except Exception:
+                _prog("save accounts failed")
+        if team_id:
+            try:
+                teams = state_store.load_json("teams", TEAMS_FILE, []) or []
+                if not isinstance(teams, list): teams = []
+                for team in teams:
+                    if isinstance(team, dict) and team.get("id") == team_id:
+                        team["members"] = [{"uid": str(a.get("auth_uid")), "nickname": a.get("nickname"), "clan_status": "pending"} for a in created]
+                        team["status"] = "created" if len(created) == count else ("partial" if created else "failed")
+                    break
+                state_store.save_json("teams", TEAMS_FILE, teams)
+            except Exception:
+                pass
         if created:
             _prog(f"Starting {len(created)} bot workers...")
             for i, a in enumerate(created):
@@ -2824,10 +2865,21 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
         else:
             _prog("No accounts created.")
         return created
-    except Exception as e:
-        _prog(f"create_four_accounts error: {e}")
-        traceback.print_exc(); return []
+    except Exception:
+        _prog("create_four_accounts error")
+        return []
     finally:
+        if team_id:
+            try:
+                teams = state_store.load_json("teams", TEAMS_FILE, []) or []
+                if isinstance(teams, list):
+                    for team in teams:
+                        if isinstance(team, dict) and team.get("id") == team_id and team.get("status") == "creating":
+                            team["status"] = "failed"
+                            state_store.save_json("teams", TEAMS_FILE, teams)
+                            break
+            except Exception:
+                pass
         bot_state.creating = False
         print_rule(color=PX.MAGENTA)
 
@@ -2991,6 +3043,7 @@ async def api_progress(request):
                                     content_type="application/json")
 
 async def api_create_team(request):
+    team_id = None
     try:
         body = await request.json()
         region = str(body.get("region", "ID")).upper()
@@ -3002,11 +3055,86 @@ async def api_create_team(request):
         if bot_state.creating:
             return aiohttp.web.json_response({"ok": False, "error": "already creating"})
         count = max(1, min(4, count))
-        asyncio.create_task(create_four_accounts(region, clan_id, count, password))
+        team_id = uuid.uuid4().hex
+        team = {"id": team_id, "created_at": datetime.now().astimezone().isoformat(),
+                "region": region, "clan_id": clan_id, "expected_count": count,
+                "status": "creating", "members": []}
+        teams = state_store.load_json("teams", TEAMS_FILE, []) or []
+        if not isinstance(teams, list): teams = []
+        teams.append(team)
+        state_store.save_json("teams", TEAMS_FILE, teams)
+        async def create_and_finalize():
+            try:
+                await create_four_accounts(region, clan_id, count, password, team_id=team_id)
+            except Exception:
+                try:
+                    current = state_store.load_json("teams", TEAMS_FILE, []) or []
+                    for item in current:
+                        if isinstance(item, dict) and item.get("id") == team_id:
+                            item["status"] = "partial" if item.get("members") else "failed"
+                    state_store.save_json("teams", TEAMS_FILE, current)
+                except Exception:
+                    pass
+        asyncio.create_task(create_and_finalize())
         return aiohttp.web.json_response({"ok": True, "msg": f"creating {count} bots"})
-    except Exception as e:
-        traceback.print_exc()
-        return aiohttp.web.json_response({"ok": False, "error": str(e)})
+    except Exception:
+        return aiohttp.web.json_response({"ok": False, "error": "Unable to create team"})
+
+def _runtime_account_for_auth_uid(uid):
+    uid = str(uid)
+    game_id = bot_state.auth_to_game_id.get(uid)
+    if game_id is not None:
+        account = bot_state.accounts.get(str(game_id))
+        if account is not None:
+            return account
+    for account in bot_state.accounts.values():
+        if str(account.get("auth_uid") or "") == uid:
+            return account
+    return bot_state.accounts.get(uid, {})
+
+async def api_teams(request):
+    try:
+        stored = state_store.load_json("teams", TEAMS_FILE, []) or []
+        if not isinstance(stored, list): stored = []
+        output = []
+        # Include runtime accounts in newly created team records without exposing credentials.
+        for team in stored:
+            if not isinstance(team, dict): continue
+            members = []
+            for member in team.get("members", []):
+                if not isinstance(member, dict): continue
+                uid = str(member.get("uid", ""))
+                runtime = _runtime_account_for_auth_uid(uid)
+                safe = {"uid": uid, "status": runtime.get("status", "OFFLINE"),
+                        "clan_status": member.get("clan_status", "unknown")}
+                nickname = runtime.get("nickname") or member.get("nickname")
+                if nickname is not None: safe["nickname"] = nickname
+                members.append(safe)
+            output.append({"id": team.get("id"), "region": team.get("region"),
+                "clan_id": team.get("clan_id"), "created_at": team.get("created_at"),
+                "status": team.get("status"), "expected_count": team.get("expected_count"),
+                "legacy": False, "members": members})
+        # Legacy accounts only reveal a clan association, not historical team boundaries.
+        records = state_store.load_json("accounts", ACCOUNTS_FILE, []) or []
+        groups = {}
+        for record in records if isinstance(records, list) else []:
+            if not isinstance(record, dict) or not record.get("clan_id") or record.get("team_id"): continue
+            key = (str(record.get("region", "")), str(record.get("clan_id")))
+            groups.setdefault(key, []).append(record)
+        for (region, clan_id), records_for_group in groups.items():
+            members = []
+            for record in records_for_group:
+                uid = str(record.get("uid", "")); runtime = _runtime_account_for_auth_uid(uid)
+                item = {"uid": uid, "status": runtime.get("status", "OFFLINE"), "clan_status": "unknown"}
+                nickname = runtime.get("nickname")
+                if nickname is not None: item["nickname"] = nickname
+                members.append(item)
+            output.append({"id": "legacy:" + region + ":" + clan_id, "region": region,
+                "clan_id": clan_id, "created_at": None, "status": "legacy",
+                "legacy": True, "members": members})
+        return aiohttp.web.json_response({"teams": output})
+    except Exception:
+        return aiohttp.web.json_response({"teams": []}, status=500)
 
 async def api_account_add(request):
     try:
@@ -3317,6 +3445,7 @@ async def start_web_server():
     app.router.add_get("/api/ping", api_ping)
     app.router.add_get("/api/stats", api_stats)
     app.router.add_get("/api/state", api_state)
+    app.router.add_get("/api/teams", api_teams)
     app.router.add_get("/api/account/export", api_account_export)
     app.router.add_post("/api/create_team", api_create_team)
     app.router.add_post("/api/account/add", api_account_add)
