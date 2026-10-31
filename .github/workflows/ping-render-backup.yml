@@ -1,0 +1,30 @@
+name: Ping Render service (staggered backup)
+on:
+  schedule:
+    - cron: '4,12,20,28,36,44,52 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping Render with retries
+        run: |
+          for attempt in 1 2 3; do
+            echo "Ping attempt ${attempt}/3"
+            if curl --fail --silent --show-error --location \
+              --connect-timeout 10 --max-time 30 \
+              --user-agent 'GitHub-Actions-Uptime-Check' \
+              'https://hhhh-2-7k5d.onrender.com/' \
+              --output /dev/null; then
+              echo 'Render ping succeeded.'
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep 10
+            fi
+          done
+          echo '::error::Render ping failed after 3 attempts.'
+          exit 1
