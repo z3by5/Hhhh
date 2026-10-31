@@ -1,0 +1,21 @@
+name: Ping Render service
+
+on:
+  schedule:
+    - cron: '*/8 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Send HTTP request
+        run: |
+          curl --fail --silent --show-error --location --max-time 30 \
+            --user-agent 'GitHub-Actions-Uptime-Check' \
+            'https://hhhh-2-7k5d.onrender.com/' \
+            --output /dev/null
