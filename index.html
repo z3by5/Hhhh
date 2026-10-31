@@ -303,6 +303,16 @@ button{cursor:pointer;background:none;border:0}
     <div class="card-actions"><button type="button" class="btn" id="confirmNo">Cancel</button><button type="button" class="btn danger" id="confirmYes"><i class="fa-solid fa-trash"></i>Confirm</button></div>
   </div>
 </div>
+<div class="modal" id="authModal" aria-hidden="true">
+  <div class="sheet">
+    <h2>Admin access</h2>
+    <form id="authForm" novalidate>
+      <p class="lead">Enter the admin token configured in the hosting environment.</p>
+      <div class="field"><label for="adminToken">Admin token</label><input type="password" id="adminToken" autocomplete="current-password" required></div>
+      <div class="card-actions"><button type="submit" class="btn primary">Unlock dashboard</button></div>
+    </form>
+  </div>
+</div>
 <div class="toasts" id="toastBox" aria-live="polite"></div>
 
 <script>
@@ -353,10 +363,10 @@ function closeModal(id){
   m.classList.remove("active"); m.setAttribute("aria-hidden","true");
   if(id === "confirmModal" && confirmRes){ const r = confirmRes; confirmRes = null; r(false); }
 }
-document.querySelectorAll(".modal").forEach(m => m.addEventListener("click", e => { if(e.target === m) closeModal(m.id); }));
+document.querySelectorAll(".modal").forEach(m => m.addEventListener("click", e => { if(e.target === m && m.id !== "authModal") closeModal(m.id); }));
 document.querySelectorAll("[data-close]").forEach(b => b.addEventListener("click", () => closeModal(b.dataset.close)));
 document.querySelectorAll("[data-open]").forEach(b => b.addEventListener("click", () => openModal(b.dataset.open)));
-document.addEventListener("keydown", e => { if(e.key === "Escape"){ const o = [...document.querySelectorAll(".modal.active")].pop(); if(o) closeModal(o.id); } });
+document.addEventListener("keydown", e => { if(e.key === "Escape"){ const o = [...document.querySelectorAll(".modal.active")].pop(); if(o && o.id !== "authModal") closeModal(o.id); } });
 function confirmDialog(msg){ $("confirmMsg").textContent = msg; openModal("confirmModal"); return new Promise(r => { confirmRes = r; }); }
 $("confirmNo").addEventListener("click", () => closeModal("confirmModal"));
 $("confirmYes").addEventListener("click", () => { if(confirmRes){ const r = confirmRes; confirmRes = null; r(true); } closeModal("confirmModal"); });
@@ -385,8 +395,45 @@ function init(){
 init();
 
 /* ---------- API ---------- */
+let authPromptBlocked = false;
+let adminTokenPromise = null;
+async function getAdminToken(){
+  const saved = sessionStorage.getItem("adminApiToken");
+  if(saved) return saved;
+  if(authPromptBlocked) throw new Error("Admin token rejected. Reload the page to try again.");
+  if(adminTokenPromise) return adminTokenPromise;
+  adminTokenPromise = new Promise(resolve => {
+    const form = $("authForm"), input = $("adminToken");
+    const submit = e => {
+      e.preventDefault();
+      const token = input.value.trim();
+      if(!token) return;
+      sessionStorage.setItem("adminApiToken", token);
+      input.value = "";
+      closeModal("authModal");
+      form.removeEventListener("submit", submit);
+      adminTokenPromise = null;
+      resolve(token);
+    };
+    form.addEventListener("submit", submit);
+    openModal("authModal");
+  });
+  return adminTokenPromise;
+}
+async function apiFetch(url, options={}){
+  const token = url === "/api/ping" ? "" : await getAdminToken();
+  const headers = new Headers(options.headers || {});
+  if(token) headers.set("Authorization", "Bearer " + token);
+  const response = await fetch(url, {...options, headers});
+  if(response.status === 401){
+    sessionStorage.removeItem("adminApiToken");
+    authPromptBlocked = true;
+    throw new Error("Admin token rejected. Reload the page and enter the correct token.");
+  }
+  return response;
+}
 async function post(url, body){
-  const r = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body: body ? JSON.stringify(body) : undefined});
+  const r = await apiFetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body: body ? JSON.stringify(body) : undefined});
   let d = {}; try{ d = await r.json(); }catch(e){}
   if(!r.ok && !d.error) d.error = "HTTP " + r.status;
   return d;
@@ -610,7 +657,7 @@ $("logFilters").addEventListener("click", e => {
   renderLogs(state.logs);
 });
 $("btnClearLogs").addEventListener("click", () => guard("clearLogs", async () => {
-  try{ const r = await fetch("/api/logs/clear", {method:"POST"}); if(!r.ok) throw 0; state.logs = []; renderLogs([]); toast("Console cleared", "success"); }
+  try{ const r = await apiFetch("/api/logs/clear", {method:"POST"}); if(!r.ok) throw 0; state.logs = []; renderLogs([]); toast("Console cleared", "success"); }
   catch(e){ toast("Failed to clear logs", "error"); }
 }));
 $("btnAutoscroll").addEventListener("click", () => { autoScroll = !autoScroll; $("btnAutoscroll").classList.toggle("on", autoScroll); if(autoScroll) scrollLogsToEnd(); });
@@ -660,8 +707,8 @@ async function fetchStats(manual){
   if(inflight) return; inflight = true;
   const ic = $("syncIcon"); ic.classList.add("spin");
   try{
-    const r = await fetch("/api/stats", {cache:"no-store"});
-    if(!r.ok) throw new Error("HTTP " + r.status);
+    const r = await apiFetch("/api/stats", {cache:"no-store"});
+    if(!r.ok){ const err = await r.clone().json().catch(() => ({})); throw new Error(err.error || ("HTTP " + r.status)); }
     const d = await r.json();
     state.accounts = Array.isArray(d.accounts) ? d.accounts : [];
     state.logs = Array.isArray(d.logs) ? d.logs : [];
@@ -670,7 +717,7 @@ async function fetchStats(manual){
     renderAccounts(state.accounts, false); renderLogs(state.logs); renderOverview(d); setStatus(true);
   }catch(e){
     console.warn("Backend sync error:", e);
-    if(state.online || manual) toast("Backend connection failed", "error");
+    if(state.online || manual) toast(e.message || "Backend connection failed", "error");
     setStatus(false);
     const c = $("connecting"); if(c && !state.loaded) c.innerHTML = '<i class="fa-solid fa-plug-circle-xmark big"></i>Cannot reach backend API';
   }finally{ inflight = false; setTimeout(() => ic.classList.remove("spin"), 400); }

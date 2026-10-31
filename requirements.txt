@@ -5,3 +5,4 @@ protobuf-decoder
 protobuf
 requests
 aiohttp
+mysql-connector-python>=9.0,<10

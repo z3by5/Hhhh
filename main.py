@@ -26,6 +26,7 @@ import itertools, traceback, ssl, hmac, hashlib, string, re, subprocess, math
 import httpx
 import aiohttp
 import aiohttp.web
+import state_store
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -519,19 +520,16 @@ def _generate_new_device() -> dict:
             "memory":random.randint(2800,6500)}
 
 def get_device_for_account(acc_key: str) -> dict:
-    devices = {}
-    if os.path.exists(DEVICES_FILE):
-        try:
-            with open(DEVICES_FILE,"r",encoding="utf-8") as f:
-                devices = json.load(f)
-                if not isinstance(devices, dict): devices = {}
-        except Exception: devices = {}
+    try:
+        devices = state_store.load_json("devices", DEVICES_FILE, {})
+        if not isinstance(devices, dict): devices = {}
+    except state_store.StoreError:
+        raise
+    except Exception:
+        devices = {}
     if acc_key in devices: return devices[acc_key]
     nd = _generate_new_device(); devices[acc_key] = nd
-    try:
-        with open(DEVICES_FILE,"w",encoding="utf-8") as f:
-            json.dump(devices, f, indent=2)
-    except Exception: pass
+    state_store.save_json("devices", DEVICES_FILE, devices)
     return nd
 
 def encode_f14(s):
@@ -1685,25 +1683,26 @@ def _load_token_cache():
     now = time.time()
     if _token_cache_memo and (now - _token_cache_memo_time) < _TOKEN_CACHE_MEMO_TTL:
         return _token_cache_memo
-    if not os.path.exists(TOKEN_CACHE_FILE): return {}
     try:
-        with open(TOKEN_CACHE_FILE,"r",encoding="utf-8") as f: content = f.read().strip()
-        if not content: return {}
-        data = json.loads(content)
-        parsed = _json_deserializer(data)
+        parsed = state_store.load_json(
+            "token_cache", TOKEN_CACHE_FILE, {},
+            decoder=_json_deserializer, encoder=_json_serializer)
+        if not isinstance(parsed, dict): parsed = {}
         _token_cache_memo = parsed; _token_cache_memo_time = now
         return parsed
-    except Exception:
-        try: os.remove(TOKEN_CACHE_FILE)
-        except Exception: pass
+    except state_store.StoreError:
+        raise
+    except Exception as e:
+        print_error(f"Cache load: {e}")
         return {}
 
 def _save_token_cache(cache):
     global _token_cache_memo, _token_cache_memo_time
     try:
-        with open(TOKEN_CACHE_FILE,"w",encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, default=_json_serializer)
+        state_store.save_json("token_cache", TOKEN_CACHE_FILE, cache, encoder=_json_serializer)
         _token_cache_memo = cache; _token_cache_memo_time = time.time()
+    except state_store.StoreError:
+        raise
     except Exception as e: print_error(f"Cache save: {e}")
 
 def cache_get(uid):
@@ -2795,22 +2794,18 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
                 traceback.print_exc()
         if created:
             try:
-                existing = []
-                if os.path.exists(ACCOUNTS_FILE):
-                    try:
-                        with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-                            existing = json.load(f) or []
-                            if not isinstance(existing, list): existing = []
-                    except Exception: existing = []
+                existing = state_store.load_json("accounts", ACCOUNTS_FILE, [])
+                if not isinstance(existing, list): existing = []
                 existing_uids = {str(a.get("uid")) for a in existing if isinstance(a, dict)}
                 for a in created:
                     u = str(a['auth_uid'])
                     if u not in existing_uids:
                         existing.append({"uid": u, "password": a['auth_password'],
                                          "region": region, "clan_id": clan_id})
-                with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
-                    json.dump(existing, f, indent=2)
+                state_store.save_json("accounts", ACCOUNTS_FILE, existing)
                 _prog(f"{len(created)} accounts saved")
+            except state_store.StoreError:
+                raise
             except Exception as e:
                 _prog(f"save accounts: {e}")
         if created:
@@ -2838,13 +2833,10 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
 
 # ==================== AUTO-LOAD ====================
 async def _autoload_accounts():
-    if not os.path.exists(ACCOUNTS_FILE):
-        print_info("[BOOT] No accounts.json"); return
     try:
-        with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-            accounts = json.load(f) or []
+        accounts = state_store.load_json("accounts", ACCOUNTS_FILE, []) or []
     except Exception as e:
-        print_error(f"[BOOT] Load fail: {e}"); return
+        print_error(f"[BOOT] Account state load failed: {type(e).__name__}"); return
     if not isinstance(accounts, list) or not accounts:
         print_info("[BOOT] accounts.json empty"); return
     print_premium(f"Auto-loading {len(accounts)} account(s)",
@@ -2852,6 +2844,13 @@ async def _autoload_accounts():
     for i, a in enumerate(accounts):
         try:
             if not isinstance(a, dict): continue
+            token = str(a.get("token", "")).strip()
+            if token:
+                task = asyncio.create_task(account_loop_token(token))
+                bot_state.account_workers[f"tok_{token[:16]}"] = task
+                print_info(f"token worker ({i+1}/{len(accounts)}) started")
+                await asyncio.sleep(0.5)
+                continue
             uid = str(a.get("uid", "")).strip()
             password = str(a.get("password", "")).strip()
             region = str(a.get("region", "")).strip() or None
@@ -2866,6 +2865,23 @@ async def _autoload_accounts():
             print_error(f"[BOOT] worker {i+1}: {e}")
 
 # ==================== HTTP SERVER ====================
+@aiohttp.web.middleware
+async def _api_auth(request, handler):
+    # Keep only the uptime endpoint public. All account/state APIs require a secret.
+    if not request.path.startswith("/api/") or request.path == "/api/ping":
+        return await handler(request)
+    expected = os.environ.get("ADMIN_API_TOKEN", "").strip()
+    if len(expected) < 32:
+        return aiohttp.web.json_response(
+            {"error": "ADMIN_API_TOKEN is not configured (minimum 32 characters)."},
+            status=503)
+    authorization = request.headers.get("Authorization", "")
+    supplied = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+    if not hmac.compare_digest(supplied, expected):
+        return aiohttp.web.json_response({"error": "Unauthorized"}, status=401)
+    return await handler(request)
+
+
 @aiohttp.web.middleware
 async def _req_logger(request, handler):
     print(f"{PX.SLATE}[REQ]{PX.RESET} {PX.BOLD}{request.method}{PX.RESET} {PX.SKY}{request.path}{PX.RESET}")
@@ -2897,9 +2913,19 @@ async def serve_index(request):
 async def api_ping(request):
     return aiohttp.web.json_response({"pong": True, "app": "RAFIN TxT", "version": "2.0"})
 
+_PRIVATE_ACCOUNT_FIELDS = {
+    "token", "access_token", "auth_token", "auth_password", "password",
+    "auth_uid", "open_id", "aes_ak", "iv_i", "login_payload_data",
+    "functional_addrs", "informational_addrs",
+}
+
+def _public_account_view(account):
+    return {key: value for key, value in account.items() if key not in _PRIVATE_ACCOUNT_FIELDS}
+
+
 async def api_stats(request):
     try:
-        accs = list(bot_state.accounts.values())
+        accs = [_public_account_view(a) for a in bot_state.accounts.values()]
         online = sum(1 for a in accs if a.get("status") in ("ONLINE","IN_MATCH","SEARCHING"))
         active_matches = sum(a.get("active_matches", 0) for a in accs)
         uptime = max(1, int(time.time() - bot_state.start_time))
@@ -2946,7 +2972,7 @@ async def api_state(request):
         return aiohttp.web.Response(text=json.dumps({
             "creating": bool(bot_state.creating),
             "create_progress": [str(x) for x in bot_state.create_progress[-40:]],
-            "accounts": list(bot_state.accounts.values()),
+            "accounts": [_public_account_view(a) for a in bot_state.accounts.values()],
             "team_size": len(_team_state["peers"]),
         }, default=str, ensure_ascii=False), content_type="application/json", charset="utf-8")
     except Exception as e:
@@ -2989,13 +3015,40 @@ async def api_account_add(request):
             token = str(body["token"]).strip()
             if not token:
                 return aiohttp.web.json_response({"status": "error", "error": "empty token"})
-            asyncio.create_task(account_loop_token(token))
+            records = state_store.load_json("accounts", ACCOUNTS_FILE, [])
+            if not isinstance(records, list): records = []
+            if not any(str(a.get("token", "")) == token for a in records if isinstance(a, dict)):
+                records.append({"token": token})
+                state_store.save_json("accounts", ACCOUNTS_FILE, records)
+            worker_key = f"tok_{token[:16]}"
+            existing_task = bot_state.account_workers.get(worker_key)
+            if existing_task and not existing_task.done():
+                return aiohttp.web.json_response({"status": "ok", "msg": "already running"})
+            task = asyncio.create_task(account_loop_token(token))
+            bot_state.account_workers[worker_key] = task
             return aiohttp.web.json_response({"status": "ok"})
         uid = str(body.get("uid", "")).strip()
         password = str(body.get("password", "")).strip()
         if not uid or not password:
             return aiohttp.web.json_response({"status": "error", "error": "uid/password required"})
-        asyncio.create_task(account_loop_guest(uid, password))
+        records = state_store.load_json("accounts", ACCOUNTS_FILE, [])
+        if not isinstance(records, list): records = []
+        records = [a for a in records if not isinstance(a, dict) or str(a.get("uid", "")) != uid]
+        records.append({"uid": uid, "password": password})
+        state_store.save_json("accounts", ACCOUNTS_FILE, records)
+        old_task = bot_state.account_workers.get(uid)
+        if old_task and not old_task.done():
+            old_task.cancel()
+            try: await old_task
+            except asyncio.CancelledError: pass
+            except Exception: pass
+        old_game_uid = bot_state.auth_to_game_id.pop(uid, None)
+        if old_game_uid:
+            bot_state.game_to_auth_id.pop(str(old_game_uid), None)
+            bot_state.account_workers.pop(str(old_game_uid), None)
+            bot_state.accounts.pop(str(old_game_uid), None)
+        task = asyncio.create_task(account_loop_guest(uid, password))
+        bot_state.account_workers[uid] = task
         return aiohttp.web.json_response({"status": "ok"})
     except Exception as e:
         return aiohttp.web.json_response({"status": "error", "error": str(e)})
@@ -3005,7 +3058,16 @@ async def api_account_delete(request):
         body = await request.json()
         uid = str(body.get("uid", "")).strip()
         auth_uid = str(body.get("auth_uid", "")).strip()
-        for u in {uid, auth_uid} - {""}:
+        if not auth_uid and uid in bot_state.game_to_auth_id:
+            auth_uid = str(bot_state.game_to_auth_id[uid])
+        candidate_ids = {uid, auth_uid} - {""}
+        tokens_to_remove = set()
+        for candidate in candidate_ids:
+            credentials = bot_state.account_credentials.get(candidate, {})
+            access_token = credentials.get("auth_token") or credentials.get("access_token")
+            if access_token:
+                tokens_to_remove.add(str(access_token))
+        for u in candidate_ids:
             if u in bot_state.account_workers:
                 try: bot_state.account_workers[u].cancel()
                 except Exception: pass
@@ -3013,6 +3075,22 @@ async def api_account_delete(request):
             if u in bot_state.accounts: del bot_state.accounts[u]
             cache_invalidate(u)
             bot_state.toggle_pause(u, False)
+            bot_state.account_credentials.pop(u, None)
+        for token in tokens_to_remove:
+            worker_key = f"tok_{token[:16]}"
+            task = bot_state.account_workers.pop(worker_key, None)
+            if task and not task.done(): task.cancel()
+            cache_invalidate(f"tok_{token[:20]}")
+        records = state_store.load_json("accounts", ACCOUNTS_FILE, [])
+        if isinstance(records, list):
+            records = [a for a in records if not isinstance(a, dict) or (
+                str(a.get("uid", "")) not in candidate_ids and
+                str(a.get("token", "")) not in tokens_to_remove)]
+            state_store.save_json("accounts", ACCOUNTS_FILE, records)
+        devices = state_store.load_json("devices", DEVICES_FILE, {})
+        if isinstance(devices, dict):
+            for u in candidate_ids: devices.pop(u, None)
+            state_store.save_json("devices", DEVICES_FILE, devices)
         return aiohttp.web.json_response({"status": "ok"})
     except Exception as e:
         return aiohttp.web.json_response({"status": "error", "error": str(e)})
@@ -3039,14 +3117,14 @@ async def api_account_restart(request):
                 except Exception: pass
                 bot_state.account_workers.pop(u, None)
         try:
-            if os.path.exists(ACCOUNTS_FILE):
-                with open(ACCOUNTS_FILE,"r",encoding="utf-8") as f:
-                    accs = json.load(f)
-                for a in accs:
-                    if str(a.get("uid")) in resolved and a.get("password"):
-                        t = asyncio.create_task(account_loop_guest(str(a["uid"]), a["password"]))
-                        bot_state.account_workers[str(a["uid"])] = t
-                        break
+            accs = state_store.load_json("accounts", ACCOUNTS_FILE, [])
+            for a in accs:
+                if str(a.get("uid")) in resolved and a.get("password"):
+                    t = asyncio.create_task(account_loop_guest(str(a["uid"]), a["password"]))
+                    bot_state.account_workers[str(a["uid"])] = t
+                    break
+        except state_store.StoreError:
+            raise
         except Exception: pass
         return aiohttp.web.json_response({"status": "ok"})
     except Exception as e:
@@ -3131,7 +3209,7 @@ async def account_loop_token(token):
         print_error(f"TOKEN {e}")
 
 async def start_web_server():
-    app = aiohttp.web.Application(middlewares=[_req_logger])
+    app = aiohttp.web.Application(middlewares=[_api_auth, _req_logger])
     app.router.add_get("/", serve_index)
     app.router.add_get("/index.html", serve_index)
     app.router.add_get("/api/ping", api_ping)
@@ -3158,6 +3236,13 @@ async def start_web_server():
 async def main():
     print_banner()
     try:
+        if state_store.database_configured():
+            state_store.initialize()
+            print_success("[STORAGE] TiDB state store initialized with TLS")
+        else:
+            print_warning("[STORAGE] TiDB is not configured; using local JSON files")
+        if len(os.environ.get("ADMIN_API_TOKEN", "").strip()) < 32:
+            print_warning("[SECURITY] Set ADMIN_API_TOKEN (32+ characters) in the service environment")
         await start_web_server()
     except Exception as e:
         print_error(f"WEB {e}"); return
