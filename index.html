@@ -307,7 +307,7 @@ button{cursor:pointer;background:none;border:0}
   <div class="sheet">
     <h2>Admin access</h2>
     <form id="authForm" novalidate>
-      <p class="lead">Enter the admin token configured in the hosting environment.</p>
+      <p class="lead">Enter the admin token configured in the hosting environment. This browser will remember it so you only need to enter it once. Keep this device private.</p>
       <div class="field"><label for="adminToken">Admin token</label><input type="password" id="adminToken" autocomplete="current-password" required></div>
       <div class="card-actions"><button type="submit" class="btn primary">Unlock dashboard</button></div>
     </form>
@@ -397,9 +397,17 @@ init();
 /* ---------- API ---------- */
 let authPromptBlocked = false;
 let adminTokenPromise = null;
+let currentAdminToken = "";
 async function getAdminToken(){
-  const saved = sessionStorage.getItem("adminApiToken");
-  if(saved) return saved;
+  let saved = currentAdminToken;
+  if(!saved){
+    try{ saved = localStorage.getItem("adminApiToken") || sessionStorage.getItem("adminApiToken") || ""; }catch(e){}
+  }
+  if(saved){
+    currentAdminToken = saved;
+    try{ localStorage.setItem("adminApiToken", saved); sessionStorage.removeItem("adminApiToken"); }catch(e){}
+    return saved;
+  }
   if(authPromptBlocked) throw new Error("Admin token rejected. Reload the page to try again.");
   if(adminTokenPromise) return adminTokenPromise;
   adminTokenPromise = new Promise(resolve => {
@@ -408,7 +416,9 @@ async function getAdminToken(){
       e.preventDefault();
       const token = input.value.trim();
       if(!token) return;
-      sessionStorage.setItem("adminApiToken", token);
+      currentAdminToken = token;
+      try{ localStorage.setItem("adminApiToken", token); sessionStorage.removeItem("adminApiToken"); }
+      catch(e){ try{ sessionStorage.setItem("adminApiToken", token); }catch(e2){} }
       input.value = "";
       closeModal("authModal");
       form.removeEventListener("submit", submit);
@@ -426,7 +436,8 @@ async function apiFetch(url, options={}){
   if(token) headers.set("Authorization", "Bearer " + token);
   const response = await fetch(url, {...options, headers});
   if(response.status === 401){
-    sessionStorage.removeItem("adminApiToken");
+    currentAdminToken = "";
+    try{ localStorage.removeItem("adminApiToken"); sessionStorage.removeItem("adminApiToken"); }catch(e){}
     authPromptBlocked = true;
     throw new Error("Admin token rejected. Reload the page and enter the correct token.");
   }
