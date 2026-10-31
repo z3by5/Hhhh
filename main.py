@@ -3053,6 +3053,67 @@ async def api_account_add(request):
     except Exception as e:
         return aiohttp.web.json_response({"status": "error", "error": str(e)})
 
+async def _delayed_import_guest_start(uid, password, delay):
+    if delay > 0:
+        await asyncio.sleep(delay)
+    await account_loop_guest(uid, password)
+
+async def api_account_import(request):
+    counts = {"added": 0, "duplicate_skipped": 0, "invalid": 0}
+    try:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("accounts"), list):
+            counts["invalid"] = 1
+            return aiohttp.web.json_response(counts, status=400)
+
+        items = body["accounts"]
+        if len(items) > 100:
+            counts["invalid"] = len(items)
+            return aiohttp.web.json_response(counts, status=413)
+
+        records = state_store.load_json("accounts", ACCOUNTS_FILE, [])
+        if not isinstance(records, list):
+            records = []
+        known_uids = {
+            str(record.get("uid", "")).strip()
+            for record in records if isinstance(record, dict) and record.get("uid") is not None
+        }
+        batch_uids = set()
+        accepted = []
+        for item in items:
+            if not isinstance(item, dict):
+                counts["invalid"] += 1
+                continue
+            uid = item.get("uid")
+            password = item.get("password")
+            if not isinstance(uid, str) or not isinstance(password, str):
+                counts["invalid"] += 1
+                continue
+            uid, password = uid.strip(), password.strip()
+            if not uid or not password or len(uid) > 128 or len(password) > 256:
+                counts["invalid"] += 1
+                continue
+            active_task = bot_state.account_workers.get(uid)
+            if uid in known_uids or uid in batch_uids or (active_task and not active_task.done()):
+                counts["duplicate_skipped"] += 1
+                continue
+            batch_uids.add(uid)
+            accepted.append((uid, password))
+
+        # Persist the complete accepted batch before any worker is scheduled.
+        records.extend({"uid": uid, "password": password} for uid, password in accepted)
+        if accepted:
+            state_store.save_json("accounts", ACCOUNTS_FILE, records)
+            for index, (uid, password) in enumerate(accepted):
+                # Spread login attempts out to avoid a burst when importing a large file.
+                task = asyncio.create_task(_delayed_import_guest_start(uid, password, index * 0.5))
+                bot_state.account_workers[uid] = task
+        counts["added"] = len(accepted)
+        return aiohttp.web.json_response(counts)
+    except Exception:
+        # Do not expose exception details: request parsing/storage errors may contain secrets.
+        return aiohttp.web.json_response(counts, status=500)
+
 async def api_account_delete(request):
     try:
         body = await request.json()
@@ -3217,6 +3278,7 @@ async def start_web_server():
     app.router.add_get("/api/state", api_state)
     app.router.add_post("/api/create_team", api_create_team)
     app.router.add_post("/api/account/add", api_account_add)
+    app.router.add_post("/api/account/import", api_account_import)
     app.router.add_post("/api/account/delete", api_account_delete)
     app.router.add_post("/api/account/refresh", api_account_refresh)
     app.router.add_post("/api/account/restart", api_account_restart)

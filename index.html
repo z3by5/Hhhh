@@ -152,6 +152,10 @@ button{cursor:pointer;background:none;border:0}
 .field textarea{min-height:110px;resize:vertical;font-family:'JetBrains Mono',monospace;font-size:12.5px}
 .field select option{background:#0d1030}
 .field input:focus,.field select:focus,.field textarea:focus{border-color:var(--accent1);box-shadow:0 0 0 3px rgba(139,92,246,.18)}
+.import-panel{border-top:1px solid var(--line);margin-top:18px;padding-top:16px}
+.import-help{margin:-8px 0 12px;color:var(--dim);font-size:12px}
+.import-status{min-height:18px;color:var(--cyan);font-size:12px;overflow-wrap:anywhere}
+.import-actions{margin-top:12px}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .card-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}
 @media(max-width:600px){.modal{align-items:flex-end;padding:0}.sheet{max-width:none;border-radius:22px 22px 0 0;padding-bottom:max(26px,env(safe-area-inset-bottom))}.two{grid-template-columns:1fr}.metrics{grid-template-columns:1fr 1fr}.metric:last-child{grid-column:1/-1}.pill span{display:none}.pill{width:38px;padding:0;justify-content:center}.page-head .row,.page-head .row .btn{width:100%}.page-head .row .btn{flex:1}}
@@ -273,6 +277,15 @@ button{cursor:pointer;background:none;border:0}
         <div class="field"><label for="accPass">Password / Key</label><input type="password" id="accPass" placeholder="••••••••" autocomplete="new-password"></div>
       </div>
       <div id="tokenInputs" hidden><div class="field"><label for="accToken">Access token</label><textarea id="accToken" placeholder="Paste the full token here..." spellcheck="false"></textarea></div></div>
+      <div class="import-panel" id="bulkImportPanel">
+        <div class="field">
+          <label for="accountsFile">Or upload guest accounts from a TXT file</label>
+          <input type="file" id="accountsFile" accept=".txt,text/plain">
+          <p class="import-help">One account per line: <code>id:pas</code>. The first colon separates ID and password; blank lines and lines starting with # or // are ignored. Maximum 100 accounts per upload.</p>
+          <div class="import-status" id="importStatus" role="status" aria-live="polite">Choose a TXT file to count valid accounts.</div>
+        </div>
+        <div class="card-actions import-actions"><button type="button" class="btn primary" id="importSubmit" disabled><i class="fa-solid fa-file-arrow-up"></i>Upload &amp; Start</button></div>
+      </div>
       <div class="card-actions"><button type="button" class="btn" data-close="addModal">Cancel</button><button type="submit" class="btn primary" id="addSubmit"><i class="fa-solid fa-rocket"></i>Save &amp; Start</button></div>
     </form>
   </div>
@@ -453,9 +466,100 @@ const busy = new Set();
 async function guard(key, fn){ if(busy.has(key)) return; busy.add(key); try{ await fn(); } finally{ busy.delete(key); } }
 
 /* add account */
-function toggleFormType(){ const g = $("accType").value === "guest"; $("guestInputs").hidden = !g; $("tokenInputs").hidden = g; }
+let pendingImportAccounts = [];
+let pendingImportStats = {duplicates:0, invalid:0};
+const MAX_IMPORT_ACCOUNTS = 100;
+function clearImportSelection(message="Choose a TXT file to count valid accounts."){
+  pendingImportAccounts = [];
+  pendingImportStats = {duplicates:0, invalid:0};
+  const input = $("accountsFile"), button = $("importSubmit"), status = $("importStatus");
+  if(input) input.value = "";
+  if(button){ button.disabled = true; button.innerHTML = '<i class="fa-solid fa-file-arrow-up"></i>Upload &amp; Start'; }
+  if(status) status.textContent = message;
+}
+function parseAccountFile(text){
+  const accounts = [], seen = new Set(); let invalid = 0, duplicates = 0;
+  for(const raw of text.replace(/^\uFEFF/, "").split(/\r?\n/)){
+    const line = raw.trim();
+    if(!line || line.startsWith("#") || line.startsWith("//")) continue;
+    const splitAt = line.indexOf(":");
+    if(splitAt <= 0){ invalid++; continue; }
+    const uid = line.slice(0, splitAt).trim(), password = line.slice(splitAt + 1).trim();
+    if(!uid || !password || uid.length > 128 || password.length > 256){ invalid++; continue; }
+    if(seen.has(uid)){ duplicates++; continue; }
+    seen.add(uid); accounts.push({uid, password});
+  }
+  return {accounts, invalid, duplicates};
+}
+function toggleFormType(){
+  const g = $("accType").value === "guest";
+  $("guestInputs").hidden = !g; $("tokenInputs").hidden = g; $("bulkImportPanel").hidden = !g;
+  if(!g) clearImportSelection("File import is available for Guest UID + Password accounts.");
+}
 $("accType").addEventListener("change", toggleFormType);
 $("btnAdd").addEventListener("click", () => openModal("addModal"));
+$("accountsFile").addEventListener("change", async () => {
+  pendingImportAccounts = []; pendingImportStats = {duplicates:0, invalid:0};
+  $("importSubmit").disabled = true;
+  $("importSubmit").innerHTML = '<i class="fa-solid fa-file-arrow-up"></i>Upload &amp; Start';
+  $("importStatus").textContent = "Reading file...";
+  const file = $("accountsFile").files && $("accountsFile").files[0];
+  if(!file){ $("importStatus").textContent = "Choose a TXT file to count valid accounts."; return; }
+  if(!file.name.toLowerCase().endsWith(".txt")){
+    clearImportSelection("Choose a .txt file. No account data was uploaded."); return;
+  }
+  if(file.size > 1024 * 1024){
+    clearImportSelection("File is too large (maximum 1 MB). No account data was uploaded."); return;
+  }
+  try{
+    const parsed = parseAccountFile(await file.text());
+    const count = parsed.accounts.length;
+    if(count > MAX_IMPORT_ACCOUNTS){
+      $("importStatus").textContent = `Read ${count} valid accounts, plus ${parsed.duplicates} duplicate and ${parsed.invalid} invalid lines. Split into files of 100 accounts or fewer.`;
+      return;
+    }
+    pendingImportAccounts = parsed.accounts;
+    pendingImportStats = {duplicates:parsed.duplicates, invalid:parsed.invalid};
+    $("importStatus").textContent = `${count} valid account(s) read. ${parsed.duplicates} duplicate line(s) and ${parsed.invalid} invalid line(s) skipped.`;
+    $("importSubmit").disabled = count === 0;
+    if(count) $("importSubmit").innerHTML = `<i class="fa-solid fa-file-arrow-up"></i>Upload &amp; Start (${count})`;
+  }catch(err){
+    clearImportSelection("Could not read this file. Save it as plain-text UTF-8 and try again.");
+  }
+});
+$("importSubmit").addEventListener("click", () => {
+  const batch = pendingImportAccounts.slice();
+  if(!batch.length) return;
+  guard("import", async () => {
+    const button = $("importSubmit"), fileInput = $("accountsFile"), status = $("importStatus");
+    button.disabled = true; fileInput.disabled = true;
+    button.innerHTML = '<i class="fa-solid fa-circle-notch spin"></i>Uploading...';
+    status.textContent = `Uploading ${batch.length} accounts...`;
+    try{
+      const d = await post("/api/account/import", {accounts: batch});
+      if(d.error || !Number.isFinite(Number(d.added))){
+        status.textContent = d.error || "Upload failed. The file has not been cleared; you can retry.";
+        toast(d.error || "Failed to upload accounts", "error"); return;
+      }
+      const added = Number(d.added) || 0;
+      const duplicates = (Number(d.duplicate_skipped ?? d.duplicates ?? d.duplicate ?? d.skipped) || 0) + pendingImportStats.duplicates;
+      const invalid = (Number(d.invalid) || 0) + pendingImportStats.invalid;
+      const read = batch.length;
+      status.textContent = `Upload complete: ${read} valid account(s) read; ${added} added; ${duplicates} duplicate(s) and ${invalid} invalid record(s) skipped.`;
+      toast(`${read} read; ${added} account(s) added; ${duplicates + invalid} skipped.`, added ? "success" : "info");
+      pendingImportAccounts = []; pendingImportStats = {duplicates:0, invalid:0}; fileInput.value = ""; fetchStats();
+    }catch(err){
+      status.textContent = "Upload failed. The selected file remains available to retry.";
+      toast("Backend connection failed while uploading", "error");
+    }finally{
+      fileInput.disabled = false;
+      button.disabled = pendingImportAccounts.length === 0;
+      button.innerHTML = pendingImportAccounts.length
+        ? `<i class="fa-solid fa-file-arrow-up"></i>Upload &amp; Start (${pendingImportAccounts.length})`
+        : '<i class="fa-solid fa-file-arrow-up"></i>Upload &amp; Start';
+    }
+  });
+});
 $("addForm").addEventListener("submit", e => {
   e.preventDefault();
   let payload;
@@ -472,7 +576,7 @@ $("addForm").addEventListener("submit", e => {
     $("addSubmit").disabled = true;
     try{
       const d = await post("/api/account/add", payload);
-      if(d.status === "ok"){ closeModal("addModal"); $("addForm").reset(); toggleFormType(); toast("Account added successfully", "success"); fetchStats(); }
+      if(d.status === "ok"){ closeModal("addModal"); $("addForm").reset(); clearImportSelection(); toggleFormType(); toast("Account added successfully", "success"); fetchStats(); }
       else toast(d.error || "Failed to add account", "error");
     }catch(err){ toast("Backend connection failed", "error"); }
     finally{ $("addSubmit").disabled = false; }
