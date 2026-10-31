@@ -3053,6 +3053,47 @@ async def api_account_add(request):
     except Exception as e:
         return aiohttp.web.json_response({"status": "error", "error": str(e)})
 
+async def api_account_export(request):
+    headers = {
+        "Content-Disposition": 'attachment; filename="accounts.txt"',
+        "Cache-Control": "no-store",
+    }
+    try:
+        records = state_store.load_json("accounts", ACCOUNTS_FILE, [])
+        if not isinstance(records, list):
+            records = []
+        exported = []
+        skipped = 0
+        seen_uids = set()
+        for record in records:
+            if not isinstance(record, dict):
+                skipped += 1
+                continue
+            uid, password = record.get("uid"), record.get("password")
+            if not isinstance(uid, str) or not isinstance(password, str):
+                skipped += 1
+                continue
+            uid, password = uid.strip(), password.strip()
+            if (not uid or not password or ":" in uid or
+                    any(char in uid for char in "\r\n\u2028\u2029") or
+                    any(char in password for char in "\r\n\u2028\u2029")):
+                skipped += 1
+                continue
+            if uid in seen_uids:
+                skipped += 1
+                continue
+            seen_uids.add(uid)
+            exported.append(f"{uid}:{password}")
+        body = "\n".join(exported) + ("\n" if exported else "")
+        headers["X-Accounts-Exported"] = str(len(exported))
+        headers["X-Accounts-Skipped"] = str(skipped)
+        return aiohttp.web.Response(
+            text=body, content_type="text/plain", charset="utf-8", headers=headers)
+    except Exception:
+        return aiohttp.web.Response(
+            text="Account export unavailable.\n", status=500,
+            content_type="text/plain", charset="utf-8", headers=headers)
+
 async def _delayed_import_guest_start(uid, password, delay):
     if delay > 0:
         await asyncio.sleep(delay)
@@ -3276,6 +3317,7 @@ async def start_web_server():
     app.router.add_get("/api/ping", api_ping)
     app.router.add_get("/api/stats", api_stats)
     app.router.add_get("/api/state", api_state)
+    app.router.add_get("/api/account/export", api_account_export)
     app.router.add_post("/api/create_team", api_create_team)
     app.router.add_post("/api/account/add", api_account_add)
     app.router.add_post("/api/account/import", api_account_import)

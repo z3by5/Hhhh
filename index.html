@@ -223,6 +223,7 @@ button{cursor:pointer;background:none;border:0}
           <div class="row">
             <button class="btn" id="btnPauseAll"><i class="fa-solid fa-pause"></i><span>Pause All</span></button>
             <button class="btn ok" data-open="teamModal"><i class="fa-solid fa-users-gear"></i>Create Team</button>
+            <button class="btn" id="btnExportAccounts" title="Download guest account credentials as a private text file"><i class="fa-solid fa-download"></i>Download accounts</button>
             <button class="btn primary" id="btnAdd"><i class="fa-solid fa-plus"></i>Add Account</button>
           </div>
         </div>
@@ -498,6 +499,33 @@ function toggleFormType(){
 }
 $("accType").addEventListener("change", toggleFormType);
 $("btnAdd").addEventListener("click", () => openModal("addModal"));
+$("btnExportAccounts").addEventListener("click", () => guard("exportAccounts", async () => {
+  const button = $("btnExportAccounts"), original = button.innerHTML;
+  button.disabled = true;
+  button.innerHTML = '<i class="fa-solid fa-circle-notch spin"></i>Preparing...';
+  try{
+    const response = await apiFetch("/api/account/export", {cache:"no-store"});
+    if(!response.ok) throw new Error("Export request failed");
+    const text = await response.text();
+    const exported = Number(response.headers.get("X-Accounts-Exported")) || 0;
+    const skipped = Number(response.headers.get("X-Accounts-Skipped")) || 0;
+    if(!exported || !text.trim()){
+      toast(skipped ? `No guest accounts to export; ${skipped} other or invalid record(s) skipped.` : "No guest UID/password accounts to export.", "info");
+      return;
+    }
+    const blob = new Blob([text], {type:"text/plain;charset=utf-8"});
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url; link.download = "accounts.txt"; link.style.display = "none";
+    document.body.appendChild(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    toast(`${exported} account(s) downloaded in id:pas format. Keep the file private.${skipped ? ` ${skipped} record(s) were skipped.` : ""}`, "success");
+  }catch(err){
+    toast("Could not download accounts. Check the admin session and try again.", "error");
+  }finally{
+    button.disabled = false; button.innerHTML = original;
+  }
+}));
 $("accountsFile").addEventListener("change", async () => {
   pendingImportAccounts = []; pendingImportStats = {duplicates:0, invalid:0};
   $("importSubmit").disabled = true;
