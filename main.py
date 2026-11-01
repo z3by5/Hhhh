@@ -1788,7 +1788,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
     ping_stop = asyncio.Event()
     movement_ctrl = None
     uid_str = str(account_id)
-    completed_cleanly = False
+    completion_reason = None
     try:
         ip, port = server_ip_port.split(":")
         port = int(port)
@@ -1837,7 +1837,9 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
 
         while not local_closed:
             if time.time() - match_start_time > MAX_MATCH_DURATION:
-                completed_cleanly = True; break
+                completion_reason = "max_duration"
+                print_warning(f"Match #{match_index} INTERRUPTED | reason=max_duration | elapsed={int(time.time() - match_start_time)}s | UID: {uid_str}")
+                break
             try:
                 response, server_addr = await asyncio.wait_for(loop.sock_recvfrom(sock, 65535), timeout=2.0)
                 if response:
@@ -1846,8 +1848,9 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                     if frame:
                         ptype = await classify(frame)
                         if frame['cmd'] in [103, 107]:
-                            print_premium(f"Match #{match_index} END", color=PX.MAGENTA, icon=I["star"])
-                            completed_cleanly = True; local_closed = True
+                            completion_reason = "server_end_signal"
+                            print_premium(f"Match #{match_index} SERVER END SIGNAL | elapsed={int(time.time() - match_start_time)}s | UID: {uid_str}", color=PX.MAGENTA, icon=I["star"])
+                            local_closed = True
                             continue
                         if frame['cmd'] == 101:
                             try:
@@ -1889,10 +1892,14 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                         except Exception: pass
                         last_activity = time.time()
                     if (time.time() - match_start_time) > 25.0:
-                        print_warning(f"Match #{match_index} Handshake timeout"); break
+                        completion_reason = "handshake_timeout"
+                        print_warning(f"Match #{match_index} INTERRUPTED | reason=handshake_timeout | elapsed={int(time.time() - match_start_time)}s | UID: {uid_str}")
+                        break
                 elif ack_state == "thunder_sharma_sent":
                     if (time.time() - last_activity) > MATCH_IDLE_TIMEOUT:
-                        completed_cleanly = True; break
+                        completion_reason = "inbound_idle_timeout"
+                        print_warning(f"Match #{match_index} INTERRUPTED | reason=inbound_idle_timeout | no_inbound={int(time.time() - last_activity)}s | elapsed={int(time.time() - match_start_time)}s | UID: {uid_str}")
+                        break
             except (BlockingIOError, OSError):
                 await asyncio.sleep(0.5); continue
             except Exception:
@@ -1901,16 +1908,17 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                 await send_thunder_sharma_inline()
         return f"match #{match_index} finished"
     except Exception as e:
+        completion_reason = "exception"
         print_error(f"Match #{match_index} {e}")
         return f"match #{match_index} error"
     finally:
         if movement_ctrl:
             try: await movement_ctrl.stop()
             except Exception: pass
-        if completed_cleanly:
+        if completion_reason == "server_end_signal":
             try:
                 bot_state.increment_match(uid_str)
-                print_premium(f"Match #{match_index} Complete | UID: {uid_str}",
+                print_premium(f"Match #{match_index} SERVER-END EVENT COUNTED | UID: {uid_str}",
                               color=PX.GOLD, icon=I["crown"])
                 try: await _mark_bot_match_finished(uid_str)
                 except Exception: pass
@@ -1922,6 +1930,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                     except Exception: pass
                 asyncio.create_task(_post_exp(uid_str))
             except Exception: pass
+        elif completion_reason:
+            bot_state.log(f"[MATCH] {match_index} not counted as finished | reason={completion_reason} | UID={uid_str}", "warning")
         ping_stop.set()
         if ping_task:
             ping_task.cancel()
