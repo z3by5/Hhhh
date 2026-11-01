@@ -257,6 +257,8 @@ button{cursor:pointer;background:none;border:0}
         <div class="page-head">
           <div><h1 class="page-title">Teams</h1><p class="page-sub">Created groups, member accounts, and clan join-request status.</p></div>
           <div class="row">
+            <button class="btn primary" id="startMatchCycle"><i class="fa-solid fa-gamepad"></i>Start Battle Royale</button>
+            <button class="btn danger" id="stopMatchCycle" disabled><i class="fa-solid fa-stop"></i>Stop</button>
             <button class="btn" id="refreshTeams"><i class="fa-solid fa-rotate"></i>Refresh</button>
             <button class="btn ok" data-open="teamModal"><i class="fa-solid fa-users-gear"></i>Create Team</button>
           </div>
@@ -266,7 +268,13 @@ button{cursor:pointer;background:none;border:0}
           <div class="stat glow"><div class="stat-top"><div class="stat-icon"><i class="fa-solid fa-users"></i></div><div class="stat-label">Accounts in teams</div></div><div class="stat-val" id="teamMembersCount">0</div><div class="stat-foot">Members listed below</div></div>
           <div class="stat glow"><div class="stat-top"><div class="stat-icon"><i class="fa-solid fa-shield-halved"></i></div><div class="stat-label">Clan requests accepted</div></div><div class="stat-val" id="teamClanAccepted">0</div><div class="stat-foot">HTTP accepted; membership not independently verified</div></div>
         </div>
-        <p class="team-note">This page only reports saved team data and the result of the existing clan join request. It does not start matches or select a game mode. Older teams may appear as clan groups if their original team boundaries were not saved.</p>
+        <p class="team-note">Saved team data reports clan join-request results only; request acceptance does not independently verify clan membership. The match-cycle panel below reports backend status and does not independently confirm game membership. Older teams may appear as clan groups if their original team boundaries were not saved.</p>
+        <section class="dist glow" aria-labelledby="matchCycleHeading">
+          <h3 id="matchCycleHeading">Battle Royale match cycle</h3>
+          <p class="team-note" id="matchCycleSummary" role="status" aria-live="polite">Loading match-cycle status...</p>
+          <div class="team-grid" id="matchCycleGroups"></div>
+          <div id="matchCycleSkipped" class="team-note" hidden></div>
+        </section>
         <div class="empty" id="teamsEmpty"><i class="fa-solid fa-people-group big"></i>Loading teams...</div>
         <div class="team-grid" id="teamsList" hidden></div>
       </section>
@@ -1019,10 +1027,102 @@ async function fetchTeams(manual){
     if(button) button.disabled = false;
   }
 }
+let matchCycleBusy = false;
+function appendCycleValue(parent, label, value){
+  const line = document.createElement("div");
+  line.className = "team-card-meta";
+  line.textContent = label + ": " + (value == null || value === "" ? "—" : String(value));
+  parent.append(line);
+}
+function renderMatchCycle(data){
+  const groups = Array.isArray(data?.groups) ? data.groups : [];
+  const skipped = Array.isArray(data?.skipped) ? data.skipped : [];
+  const summary = $("matchCycleSummary"), list = $("matchCycleGroups"), skippedBox = $("matchCycleSkipped");
+  summary.textContent = `Status: ${data?.active ? "Active" : "Inactive"} · Mode: ${data?.mode == null ? "—" : String(data.mode)} · Round: ${data?.round == null ? "—" : String(data.round)} · ${groups.length} group(s)`;
+  $("startMatchCycle").disabled = Boolean(data?.active) || matchCycleBusy;
+  $("stopMatchCycle").disabled = !data?.active || matchCycleBusy;
+  list.replaceChildren();
+  if(!groups.length){ const empty = document.createElement("p"); empty.className = "team-note"; empty.textContent = "No active Battle Royale squads."; list.append(empty); }
+  const cycleStatusLabels = {
+    forming: "Forming squad", inviting: "Sending invitations",
+    accept_packets_sent: "Invite accept packets sent; membership not server-confirmed",
+    searching: "Searching for match", in_match: "In match",
+    round_finished: "Round finished; waiting for other squads",
+    failed: "Formation failed", stopping: "Stopping", stopped: "Stopped"
+  };
+  for(const group of groups){
+    if(!group || typeof group !== "object") continue;
+    const card = document.createElement("article"); card.className = "glow team-card";
+    const head = document.createElement("div"); head.className = "team-card-head";
+    const title = document.createElement("div"); title.className = "team-card-title"; title.textContent = "Group " + (group.id == null ? "—" : String(group.id));
+    const rawStatus = String(group.status || "Unknown");
+    const status = cycleStatusLabels[rawStatus] || rawStatus;
+    head.append(title, teamBadge(status, rawStatus.toLowerCase().includes("error") || rawStatus.toLowerCase().includes("fail") ? "s-error" : "s-search"));
+    card.append(head);
+    appendCycleValue(card, "Clan", group.clan_id);
+    appendCycleValue(card, "Region", group.region);
+    appendCycleValue(card, "Round", group.round);
+    appendCycleValue(card, "Team code", group.team_code);
+    appendCycleValue(card, "Leader UID", group.leader_uid);
+    if(group.last_error != null && String(group.last_error) !== "") appendCycleValue(card, "Last error", group.last_error);
+    const members = Array.isArray(group.members) ? group.members : [];
+    const memberList = document.createElement("div"); memberList.className = "team-members";
+    if(!members.length){ const note = document.createElement("div"); note.className = "team-note"; note.textContent = "No members reported."; memberList.append(note); }
+    for(const member of members){
+      if(!member || typeof member !== "object") continue;
+      const row = document.createElement("div"); row.className = "team-member";
+      const name = document.createElement("div"); name.className = "team-member-name"; name.textContent = String(member.nickname || "Account");
+      const uid = document.createElement("div"); uid.className = "team-member-uid"; uid.textContent = "UID: " + (member.uid == null ? "—" : String(member.uid));
+      const memberStatus = String(member.status || "Unknown");
+      row.append(name, uid, teamBadge(memberStatus, memberStatus.toLowerCase().includes("error") || memberStatus.toLowerCase().includes("fail") ? "s-error" : "s-paused"));
+      memberList.append(row);
+    }
+    card.append(memberList); list.append(card);
+  }
+  skippedBox.replaceChildren();
+  skippedBox.hidden = skipped.length === 0;
+  if(skipped.length){
+    const title = document.createElement("strong"); title.textContent = "Skipped accounts"; skippedBox.append(title);
+    for(const item of skipped){
+      if(!item || typeof item !== "object") continue;
+      const line = document.createElement("div");
+      line.textContent = `UID ${item.uid == null ? "—" : String(item.uid)}: ${item.reason == null ? "No reason reported" : String(item.reason)}`;
+      skippedBox.append(line);
+    }
+  }
+}
+async function fetchMatchCycle(){
+  if(matchCycleBusy || !$("page-teams").classList.contains("active")) return;
+  try{
+    const response = await apiFetch("/api/match-cycle", {cache:"no-store"});
+    if(!response.ok) throw new Error("HTTP " + response.status);
+    renderMatchCycle(await response.json());
+  }catch(error){
+    $("matchCycleSummary").textContent = "Could not load match-cycle status. Use Refresh or check the connection.";
+  }
+}
+async function matchCycleAction(action){
+  if(matchCycleBusy) return;
+  matchCycleBusy = true;
+  const start = $("startMatchCycle"), stop = $("stopMatchCycle");
+  start.disabled = true; stop.disabled = true;
+  try{
+    const response = await apiFetch(`/api/match-cycle/${action}`, {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+    let result = {}; try{ result = await response.json(); }catch(e){}
+    if(!response.ok || result.error || result.ok === false) throw new Error(result.error || result.message || "HTTP " + response.status);
+    const detail = action === "start" ? ` Eligible accounts: ${result.eligible_accounts ?? "—"}; groups: ${Array.isArray(result.groups) ? result.groups.length : "—"}; skipped: ${Array.isArray(result.skipped) ? result.skipped.length : result.skipped ?? 0}.` : "";
+    toast((result.message || (action === "start" ? "Match cycle started." : "Stop requested.")) + detail, "success");
+  }catch(error){ toast(error.message || "Match-cycle request failed", "error"); }
+  finally{ matchCycleBusy = false; await fetchMatchCycle(); }
+}
+$("startMatchCycle").addEventListener("click", () => matchCycleAction("start"));
+$("stopMatchCycle").addEventListener("click", () => matchCycleAction("stop"));
 document.querySelectorAll('[data-page="teams"]').forEach(button => button.addEventListener("click", () => fetchTeams()));
-$("refreshTeams").addEventListener("click", () => fetchTeams(true));
+$("refreshTeams").addEventListener("click", () => { fetchTeams(true); fetchMatchCycle(); });
+document.querySelectorAll('[data-page="teams"]').forEach(button => button.addEventListener("click", fetchMatchCycle));
+setInterval(() => { if(!document.hidden && $("page-teams").classList.contains("active")) fetchMatchCycle(); }, 5000);
 setInterval(() => { if(!document.hidden && $("page-teams").classList.contains("active")) fetchTeams(); }, 15000);
-if(location.hash === "#teams") setTimeout(() => fetchTeams(), 0);
+if(location.hash === "#teams") setTimeout(() => { fetchTeams(); fetchMatchCycle(); }, 0);
 $("syncBtn").addEventListener("click", () => fetchStats(true));
 
 /* ---------- utils ---------- */

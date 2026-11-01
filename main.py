@@ -353,8 +353,61 @@ bot_state = BotState()
 
 _team_state = {"peers": {}, "leader_uid": None, "team_code": None, "lock": asyncio.Lock()}
 _restart_state = {"lock": asyncio.Lock(), "finished_bots": set(), "target": None, "restarting": False}
+_match_cycle_state = {"lock": asyncio.Lock(), "active": False, "mode": "battle_royale",
+                      "round": 0, "groups": {}, "uid_to_group": {}, "skipped": []}
+
+def _match_cycle_group_for_uid(uid):
+    uid = str(uid)
+    if uid not in _match_cycle_state["uid_to_group"]:
+        mapped_game_uid = bot_state.auth_to_game_id.get(uid)
+        if mapped_game_uid is not None: uid = str(mapped_game_uid)
+    group_id = _match_cycle_state["uid_to_group"].get(uid)
+    return _match_cycle_state["groups"].get(group_id) if group_id else None
+
+def _match_cycle_all_groups_ready():
+    groups = list(_match_cycle_state["groups"].values())
+    return bool(_match_cycle_state["active"] and groups and
+                all(g.get("status") in {"accept_packets_sent", "searching", "in_match", "round_finished"} for g in groups))
 
 async def _mark_bot_match_finished(account_id):
+    uid = str(account_id)
+    group = _match_cycle_group_for_uid(uid)
+    if group is not None:
+        if uid not in group.get("member_ids", []):
+            uid = next((member_uid for member_uid in group.get("member_ids", [])
+                        if str(bot_state.game_to_auth_id.get(member_uid, "")) == uid), uid)
+        async with _match_cycle_state["lock"]:
+            group = _match_cycle_group_for_uid(uid)
+            if group is None:
+                return
+            group.setdefault("finished", set()).add(uid)
+            members = set(group.get("member_ids", []))
+            if members and members.issubset(group["finished"]):
+                group["status"] = "round_finished"
+                bot_state.log(f"[BR] Group {group['id']} round {group['round']} finished", "success")
+                groups = list(_match_cycle_state["groups"].values())
+                if groups and all(g.get("status") == "round_finished" for g in groups):
+                    if _match_cycle_state["active"]:
+                        _match_cycle_state["round"] += 1
+                        for g in groups:
+                            g["round"] = _match_cycle_state["round"]
+                            g["status"] = "forming"
+                            g["team_code"] = None
+                            g["server_group_id"] = None
+                            g["joined"] = set()
+                            g["finished"] = set()
+                            g["match_found"] = set()
+                            g["attempts"] = 0
+                            g["leader_index"] = (g.get("leader_index", 0) + 1) % len(g["member_ids"])
+                            g["leader_uid"] = g["member_ids"][g["leader_index"]]
+                        bot_state.log(f"[BR] Starting round {_match_cycle_state['round']} for all squads", "info")
+                    else:
+                        for g in groups:
+                            g["status"] = "stopped"
+        return
+    if _match_cycle_state["active"]:
+        bot_state.log(f"[BR] Match finished for unmapped UID {uid}; legacy process restart suppressed", "warning")
+        return
     async with _restart_state["lock"]:
         if _restart_state["restarting"]: return
         _restart_state["finished_bots"].add(str(account_id))
@@ -1898,6 +1951,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
     _writer_ref = {"w": None}
     _team_active = {"flag": True}
     _match_played = {"flag": False}
+    cycle_round_seen = None
 
     async def _process_social_packet(raw_bytes, tag="MAIN"):
         try:
@@ -1992,120 +2046,150 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
     async def _team_coordinator():
         try:
             while True:
-                async with _team_state["lock"]:
-                    n = len(_team_state["peers"])
-                if n >= TEAM_SIZE: break
                 if bot_state.is_paused(uid_str): return
+                group = _match_cycle_group_for_uid(uid_str)
+                if not _match_cycle_state["active"] or group is None:
+                    await asyncio.sleep(0.5); continue
+                if len(group.get("peers", {})) != TEAM_SIZE:
+                    await asyncio.sleep(0.5); continue
+                if group.get("status") == "forming" and group.get("leader_uid") == uid_str:
+                    async with _match_cycle_state["lock"]:
+                        if group.get("status") != "forming" or group.get("leader_uid") != uid_str:
+                            continue
+                        group["status"] = "inviting"
+                        group["attempts"] = group.get("attempts", 0) + 1
+                        group["attempt_id"] = group.get("attempt_id", 0) + 1
+                        attempt_id = group["attempt_id"]
+                        group["attempt_started"] = time.time()
+                        group["joined"] = {uid_str}
+                        group["team_code"] = None
+                    own_id_num = (current_account_data.get("account_id")
+                                  if current_account_data else None)
+                    if not own_id_num:
+                        try: own_id_num = int(uid_str)
+                        except Exception: own_id_num = 0
+                    leader_writer = _writer_ref["w"]
+                    try:
+                        if not leader_writer or leader_writer.is_closing():
+                            raise ConnectionError("leader connection unavailable")
+                        pkt = create_team(current_key, current_iv, region=account_region,
+                                          game_version=client_version)
+                        leader_writer.write(pkt); await leader_writer.drain()
+                        await asyncio.sleep(1.2)
+                        pkt = team_fresh(int(own_id_num), current_key, current_iv)
+                        leader_writer.write(pkt); await leader_writer.drain()
+                        await asyncio.sleep(0.8)
+                        invite_errors = []
+                        for peer_uid in group.get("member_ids", []):
+                            if peer_uid == uid_str: continue
+                            peer_info = group.get("peers", {}).get(peer_uid, {})
+                            peer_acc_id = (peer_info.get("data") or {}).get("account_id") or peer_uid
+                            try:
+                                inv = invite_player_in_team(int(peer_acc_id), current_key, current_iv,
+                                                            region=account_region)
+                                leader_writer.write(inv); await leader_writer.drain()
+                                print_info(f"TEAM {group['id']} invite {peer_acc_id}")
+                            except Exception as e:
+                                invite_errors.append(str(e))
+                                print_warning(f"TEAM {group['id']} invite error: {type(e).__name__}")
+                            await asyncio.sleep(0.6)
+                        try:
+                            pkt = team_fresh(int(own_id_num), current_key, current_iv)
+                            leader_writer.write(pkt); await leader_writer.drain()
+                        except Exception as e:
+                            invite_errors.append(f"refresh:{type(e).__name__}")
+                        if invite_errors: group["last_error"] = "; ".join(invite_errors)[:240]
+                    except Exception as e:
+                        group["last_error"] = f"Leader setup failed: {type(e).__name__}"
+                        print_warning(f"TEAM {group['id']} leader setup failed: {type(e).__name__}")
+
+                    deadline = time.time() + 30.0
+                    while _match_cycle_state["active"] and time.time() < deadline:
+                        if group.get("attempt_id") != attempt_id or group.get("status") != "inviting":
+                            break
+                        if set(group.get("member_ids", [])).issubset(group.get("joined", set())):
+                            await asyncio.sleep(2.0)
+                            if (group.get("attempt_id") == attempt_id and
+                                    group.get("status") == "inviting" and
+                                    set(group.get("member_ids", [])).issubset(group.get("joined", set()))):
+                                group["status"] = "accept_packets_sent"
+                                group["last_error"] = None
+                                print_success(f"TEAM {group['id']} sent all invite-accept packets; waiting for all squads")
+                            break
+                        await asyncio.sleep(0.5)
+                    if group.get("status") == "inviting" and group.get("attempt_id") == attempt_id:
+                        async with _match_cycle_state["lock"]:
+                            group["last_error"] = group.get("last_error") or "Invite acceptance timed out"
+                            if group.get("attempts", 0) >= len(group.get("member_ids", [])):
+                                group["status"] = "failed"
+                                bot_state.log(f"[BR] {group['id']} could not form after trying every leader", "error")
+                            else:
+                                group["leader_index"] = (group.get("leader_index", 0) + 1) % len(group["member_ids"])
+                                group["leader_uid"] = group["member_ids"][group["leader_index"]]
+                                group["status"] = "forming"
+                                bot_state.log(f"[BR] {group['id']} invite timed out; trying leader {group['leader_uid']}", "warning")
+                    continue
+
+                if (group.get("leader_uid") == uid_str and
+                        group.get("status") in {"accept_packets_sent", "searching"} and
+                        _match_cycle_all_groups_ready()):
+                    group["status"] = "searching"
+                    bot_state.update_status(uid_str, "SEARCHING", 0)
+                    own_id = current_account_data.get("account_id", uid_str) if current_account_data else uid_str
+                    while (_match_cycle_state["active"] and _team_active["flag"] and
+                           not _match_played["flag"] and group.get("leader_uid") == uid_str):
+                        if not _match_cycle_all_groups_ready():
+                            await asyncio.sleep(0.5); continue
+                        try:
+                            if bot_state.is_paused(uid_str): break
+                            rdy = ready_for_game(int(own_id), current_key, current_iv)
+                            if _writer_ref["w"] and not _writer_ref["w"].is_closing():
+                                _writer_ref["w"].write(rdy); await _writer_ref["w"].drain()
+                            await asyncio.sleep(1.0)
+                            sm = start_match_team(int(own_id), current_key, current_iv, region=account_region)
+                            if _writer_ref["w"] and not _writer_ref["w"].is_closing():
+                                _writer_ref["w"].write(sm); await _writer_ref["w"].drain()
+                        except Exception as e:
+                            group["last_error"] = f"Start search failed: {type(e).__name__}"
+                            print_warning(f"TEAM {group['id']} start_match error: {type(e).__name__}")
+                        await asyncio.sleep(5.0)
+                    continue
                 await asyncio.sleep(0.5)
-            await asyncio.sleep(TEAM_READY_DELAY)
-            async with _team_state["lock"]:
-                is_leader = (_team_state["leader_uid"] == uid_str)
-                peers_snapshot = dict(_team_state["peers"])
-            if not is_leader:
-                print_info(f"TEAM {uid_str} waiting as member..."); return
-            print_premium(f"TEAM {uid_str} — creating squad region={account_region}",
-                          color=PX.GOLD, icon=I["crown"])
-            async with _team_state["lock"]:
-                _team_state["team_code"] = None
-            own_id_num = None
-            if current_account_data: own_id_num = current_account_data.get('account_id')
-            if not own_id_num:
-                try: own_id_num = int(uid_str)
-                except Exception: own_id_num = 0
-            try:
-                pkt = create_team(current_key, current_iv, region=account_region,
-                                  game_version=client_version)
-                if _writer_ref["w"] and not _writer_ref["w"].is_closing():
-                    _writer_ref["w"].write(pkt); await _writer_ref["w"].drain()
-                    print_info(f"TEAM create_team sent ({len(pkt)}B)")
-            except Exception as e: print_error(f"TEAM create_team err: {e}")
-            await asyncio.sleep(1.5)
-            try:
-                pkt = team_fresh(int(own_id_num), current_key, current_iv)
-                if _writer_ref["w"] and not _writer_ref["w"].is_closing():
-                    _writer_ref["w"].write(pkt); await _writer_ref["w"].drain()
-                    print_success(f"TEAM team_fresh #1 sent")
-            except Exception as e: print_warning(f"TEAM team_fresh err: {e}")
-            await asyncio.sleep(1.0)
-            async def _invite_uid(target_uid, label=""):
-                for attempt in range(2):
-                    try:
-                        inv = invite_player_in_team(int(target_uid), current_key, current_iv,
-                                                    region=account_region)
-                        if _writer_ref["w"] and not _writer_ref["w"].is_closing():
-                            _writer_ref["w"].write(inv); await _writer_ref["w"].drain()
-                            print_info(f"TEAM invite{label} → {target_uid} #{attempt+1}")
-                    except Exception as e: print_warning(f"TEAM invite err: {e}")
-                    await asyncio.sleep(0.6)
-            invite_count = 0
-            for peer_uid, peer_info in peers_snapshot.items():
-                if peer_uid == uid_str: continue
-                peer_acc_id = None
-                try: peer_acc_id = peer_info["data"].get("account_id")
-                except Exception: pass
-                if not peer_acc_id: peer_acc_id = peer_uid
-                print_premium(f"TEAM Inviting bot{invite_count+2} {peer_acc_id}...",
-                              color=PX.CYAN, icon=I["arrow"])
-                await _invite_uid(int(peer_acc_id), f" bot{invite_count+2}")
-                invite_count += 1
-            await asyncio.sleep(TEAM_INVITE_WAIT + 3.0)
-            try:
-                pkt = team_fresh(int(own_id_num), current_key, current_iv)
-                if _writer_ref["w"] and not _writer_ref["w"].is_closing():
-                    _writer_ref["w"].write(pkt); await _writer_ref["w"].drain()
-                    print_success(f"TEAM team_fresh #2 sent")
-            except Exception as e: print_warning(f"TEAM team_fresh #2 err: {e}")
-            await asyncio.sleep(1.0)
-            print_premium(f"TEAM {uid_str} SQUAD READY → start match loop",
-                          color=PX.EMERALD, icon=I["rocket"])
-            try: bot_state.update_status(uid_str, "SEARCHING", 0)
-            except Exception: pass
-            while _team_active["flag"] and not _match_played["flag"]:
-                try:
-                    if bot_state.is_paused(uid_str): break
-                    async with _team_state["lock"]:
-                        if _team_state["leader_uid"] != uid_str: break
-                    own_id = current_account_data.get('account_id', own_id_num) if current_account_data else own_id_num
-                    try:
-                        rdy = ready_for_game(int(own_id), current_key, current_iv)
-                        if _writer_ref["w"] and not _writer_ref["w"].is_closing():
-                            _writer_ref["w"].write(rdy); await _writer_ref["w"].drain()
-                    except Exception as e: print_warning(f"TEAM ready err: {e}")
-                    await asyncio.sleep(1.0)
-                    sm = start_match_team(int(own_id), current_key, current_iv, region=account_region)
-                    if _writer_ref["w"] and not _writer_ref["w"].is_closing():
-                        _writer_ref["w"].write(sm); await _writer_ref["w"].drain()
-                except Exception as e: print_warning(f"TEAM start_match err: {e}")
-                try: await asyncio.wait_for(asyncio.sleep(5.0), timeout=5.5)
-                except asyncio.TimeoutError: pass
         except asyncio.CancelledError: raise
         except Exception as e:
             print_error(f"TEAM coordinator error: {e}")
 
     async def _member_match_trigger():
         try:
-            await asyncio.sleep(TEAM_READY_DELAY + 18.0)
-            async with _team_state["lock"]:
-                if _team_state["leader_uid"] == uid_str: return
-            print_premium(f"TEAM Member {uid_str} ready loop",
-                          color=PX.SKY, icon=I["pulse"])
-            try: bot_state.update_status(uid_str, "SEARCHING", 0)
-            except Exception: pass
-            my_id = current_account_data.get('account_id', uid_str) if current_account_data else uid_str
-            while _team_active["flag"] and not _match_played["flag"]:
-                try:
-                    if bot_state.is_paused(uid_str): break
-                    if _writer_ref["w"] and not _writer_ref["w"].is_closing():
+            while True:
+                if bot_state.is_paused(uid_str): return
+                group = _match_cycle_group_for_uid(uid_str)
+                if not _match_cycle_state["active"] or group is None:
+                    await asyncio.sleep(0.5); continue
+                if group.get("leader_uid") == uid_str:
+                    await asyncio.sleep(0.5); continue
+                if group.get("status") in {"accept_packets_sent", "searching"} and _match_cycle_all_groups_ready():
+                    print_premium(f"TEAM Member {uid_str} ready for BR round {group.get('round')}",
+                                  color=PX.SKY, icon=I["pulse"])
+                    bot_state.update_status(uid_str, "SEARCHING", 0)
+                    my_id = current_account_data.get("account_id", uid_str) if current_account_data else uid_str
+                    while (_match_cycle_state["active"] and _team_active["flag"] and
+                           not _match_played["flag"] and group.get("leader_uid") != uid_str):
+                        if not _match_cycle_all_groups_ready():
+                            await asyncio.sleep(0.5); continue
                         try:
-                            rdy = ready_for_game(int(my_id), current_key, current_iv)
-                            _writer_ref["w"].write(rdy); await _writer_ref["w"].drain()
-                        except Exception as e: print_warning(f"TEAM member ready err: {e}")
-                        await asyncio.sleep(1.0)
-                        sm = start_match_team(int(my_id), current_key, current_iv, region=account_region)
-                        _writer_ref["w"].write(sm); await _writer_ref["w"].drain()
-                except Exception as e: print_warning(f"TEAM member trigger: {e}")
-                try: await asyncio.wait_for(asyncio.sleep(5.0), timeout=5.5)
-                except asyncio.TimeoutError: pass
+                            if bot_state.is_paused(uid_str): break
+                            if _writer_ref["w"] and not _writer_ref["w"].is_closing():
+                                rdy = ready_for_game(int(my_id), current_key, current_iv)
+                                _writer_ref["w"].write(rdy); await _writer_ref["w"].drain()
+                                await asyncio.sleep(1.0)
+                                sm = start_match_team(int(my_id), current_key, current_iv, region=account_region)
+                                _writer_ref["w"].write(sm); await _writer_ref["w"].drain()
+                        except Exception as e:
+                            group["last_error"] = f"Member start failed: {type(e).__name__}"
+                            print_warning(f"TEAM member trigger: {type(e).__name__}")
+                        await asyncio.sleep(5.0)
+                await asyncio.sleep(0.5)
         except asyncio.CancelledError: raise
         except Exception as e:
             print_warning(f"TEAM member trigger outer: {e}")
@@ -2166,6 +2250,9 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                     _team_state["peers"][uid_str] = {
                         "writer": writer, "data": current_account_data,
                         "key": current_key, "iv": current_iv}
+                    cycle_group = _match_cycle_group_for_uid(uid_str)
+                    if cycle_group is not None:
+                        cycle_group.setdefault("peers", {})[uid_str] = _team_state["peers"][uid_str]
                     if _team_state["leader_uid"] is None:
                         _team_state["leader_uid"] = uid_str
                         print_premium(f"TEAM {uid_str} is first peer (leader)",
@@ -2200,6 +2287,22 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
 
                 while True:
                     play_matches[:] = [m for m in play_matches if not m.done()]
+                    cycle_group = _match_cycle_group_for_uid(uid_str)
+                    if cycle_group is not None:
+                        current_round = int(cycle_group.get("round", 0))
+                        if cycle_round_seen is None:
+                            cycle_round_seen = current_round
+                        elif current_round > cycle_round_seen:
+                            cycle_round_seen = current_round
+                            if _match_played["flag"] and _match_cycle_state["active"]:
+                                _match_played["flag"] = False
+                                _team_active["flag"] = True
+                                if not team_coord_task or team_coord_task.done():
+                                    team_coord_task = asyncio.create_task(_team_coordinator())
+                                if not member_trigger_task or member_trigger_task.done():
+                                    member_trigger_task = asyncio.create_task(_member_match_trigger())
+                                bot_state.update_status(uid_str, "ONLINE", 0)
+                                bot_state.log(f"[BR] {cycle_group['id']} account {uid_str} re-armed for round {current_round}", "info")
                     if bot_state.is_paused(uid_str): break
                     if _match_played["flag"]:
                         try: data = await asyncio.wait_for(reader.read(8192), timeout=1.0)
@@ -2240,10 +2343,15 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                 cand = _f5g(fk)
                                 if cand and str(cand).isdigit() and len(str(cand)) == 7:
                                     tc = str(cand); break
+                            cycle_group = _match_cycle_group_for_uid(uid_str)
                             if tc:
-                                async with _team_state["lock"]:
-                                    _team_state["team_code"] = tc
-                                print_premium(f"TEAM Code: {tc}", color=PX.ROSE, icon=I["gem"])
+                                if cycle_group is not None:
+                                    cycle_group["team_code"] = tc
+                                    print_premium(f"TEAM {cycle_group['id']} Code: {tc}", color=PX.ROSE, icon=I["gem"])
+                                else:
+                                    async with _team_state["lock"]:
+                                        _team_state["team_code"] = tc
+                                    print_premium(f"TEAM Code: {tc}", color=PX.ROSE, icon=I["gem"])
                             group_id = _f5g(8)
                             if group_id and isinstance(group_id, str) and 20 <= len(group_id) <= 40: pass
                             else: group_id = None
@@ -2255,9 +2363,17 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                 if cand and str(cand).isdigit() and 6 <= len(str(cand)) <= 15:
                                     if str(cand) != uid_str and str(cand) != own_acc:
                                         inviter = cand; break
-                            if inviter and group_id and _team_state["leader_uid"] != uid_str:
+                            if (inviter and group_id and cycle_group is not None and
+                                    _match_cycle_state["active"] and
+                                    str(inviter) == str(cycle_group.get("leader_uid")) and
+                                    uid_str in cycle_group.get("member_ids", [])):
+                                known_group = cycle_group.get("server_group_id")
+                                if known_group and known_group != group_id:
+                                    continue
+                                cycle_group["server_group_id"] = group_id
                                 print_premium(f"TEAM Invite from {inviter} → accept",
                                               color=PX.CYAN, icon=I["arrow"])
+                                accept_sent = False
                                 for _ in range(2):
                                     try:
                                         acc = accept_team_invite(int(inviter), group_id,
@@ -2266,14 +2382,24 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                                                  game_version=client_version)
                                         if writer and not writer.is_closing():
                                             writer.write(acc); await writer.drain()
+                                            accept_sent = True
                                     except Exception as e: print_warning(f"TEAM accept err: {e}")
                                     await asyncio.sleep(0.4)
+                                if accept_sent:
+                                    cycle_group.setdefault("joined", set()).add(uid_str)
+                                    bot_state.log(f"[BR] {cycle_group['id']} invite-accept packet sent by {uid_str}", "info")
                         except Exception as e: print_warning(f"TEAM 0500 parse: {e}")
                         continue
                     if hex_data.startswith("0300") and 10 < packet_length < 30: continue
                     if hex_data.startswith("0300") and packet_length >= 300:
                         print_premium(f"Match Found | UID: {uid_str} | region={account_region}",
                                       color=PX.AMBER, icon=I["target"])
+                        cycle_group = _match_cycle_group_for_uid(uid_str)
+                        if cycle_group is not None and _match_cycle_state["active"]:
+                            cycle_group.setdefault("match_found", set()).add(uid_str)
+                            if set(cycle_group["member_ids"]).issubset(cycle_group["match_found"]):
+                                cycle_group["status"] = "in_match"
+                                bot_state.log(f"[BR] {cycle_group['id']} all squad accounts entered round {cycle_group['round']}", "success")
                         try: await _mark_match_found(uid_str)
                         except Exception: pass
                         try: await _clear_team_joined(uid_str)
@@ -2364,6 +2490,13 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                     if _team_state["leader_uid"] == uid_str:
                         _team_state["leader_uid"] = None
                         _team_state["team_code"] = None
+                cycle_group = _match_cycle_group_for_uid(uid_str)
+                if cycle_group is not None:
+                    cycle_group.get("peers", {}).pop(uid_str, None)
+                    if _match_cycle_state["active"] and cycle_group.get("status") not in {"in_match", "round_finished"}:
+                        cycle_group["joined"] = {uid for uid in cycle_group.get("joined", set()) if uid != uid_str}
+                        cycle_group["status"] = "forming"
+                        cycle_group["last_error"] = f"Account {uid_str} disconnected; waiting for reconnect"
                 try: await _clear_team_joined(uid_str)
                 except Exception: pass
                 for tk in (team_coord_task, member_trigger_task):
@@ -3136,6 +3269,169 @@ async def api_teams(request):
     except Exception:
         return aiohttp.web.json_response({"teams": []}, status=500)
 
+def _build_match_cycle_candidates(peer_snapshot):
+    """Resolve saved clan/team members to currently connected runtime accounts."""
+    candidates = {}
+    seen_auth_uids = set()
+    skipped = []
+    try:
+        account_records = state_store.load_json("accounts", ACCOUNTS_FILE, []) or []
+        saved_teams = state_store.load_json("teams", TEAMS_FILE, []) or []
+    except Exception:
+        return [], [{"uid": "—", "reason": "Could not read saved clan/team data"}]
+    if not isinstance(account_records, list): account_records = []
+    if not isinstance(saved_teams, list): saved_teams = []
+
+    # Saved team records provide clan metadata even if an imported account row omits it.
+    for team in saved_teams:
+        if not isinstance(team, dict): continue
+        team_id = str(team.get("id", "")).strip()
+        region = str(team.get("region", "ID")).upper()
+        clan_id = str(team.get("clan_id", "")).strip()
+        if not clan_id: continue
+        for member in team.get("members", []):
+            if not isinstance(member, dict): continue
+            auth_uid = str(member.get("uid", "")).strip()
+            if not auth_uid or auth_uid in seen_auth_uids: continue
+            seen_auth_uids.add(auth_uid)
+            key = (region, clan_id, "team:" + team_id if team_id else "clan")
+            candidates.setdefault(key, {})[auth_uid] = member
+
+    # Legacy rows are grouped only when their clan association is known.
+    for record in account_records:
+        if not isinstance(record, dict): continue
+        auth_uid = str(record.get("uid", "")).strip()
+        clan_id = str(record.get("clan_id", "")).strip()
+        if not auth_uid or not clan_id or auth_uid in seen_auth_uids: continue
+        seen_auth_uids.add(auth_uid)
+        region = str(record.get("region", "ID")).upper()
+        team_id = str(record.get("team_id", "")).strip()
+        key = (region, clan_id, "team:" + team_id if team_id else "clan")
+        candidates.setdefault(key, {})[auth_uid] = record
+
+    prepared = []
+    for (region, clan_id, _source_group), members in candidates.items():
+        eligible = []
+        for auth_uid, saved_member in members.items():
+            clan_status = str(saved_member.get("clan_status", "")).lower()
+            if clan_status and clan_status not in {"request_accepted", "accepted", "joined"}:
+                skipped.append({"uid": auth_uid, "reason": "Clan join request is not recorded as accepted"})
+                continue
+            runtime = _runtime_account_for_auth_uid(auth_uid)
+            game_uid = str(runtime.get("uid") or bot_state.auth_to_game_id.get(auth_uid) or "").strip()
+            status = str(runtime.get("status", "OFFLINE")).upper()
+            peer = peer_snapshot.get(game_uid) if game_uid else None
+            writer = peer.get("writer") if isinstance(peer, dict) else None
+            if not game_uid or not peer or not writer or writer.is_closing():
+                skipped.append({"uid": auth_uid, "reason": "Account is not connected"})
+                continue
+            if bot_state.is_paused(game_uid) or status in {"PAUSED", "OFFLINE", "ERROR"}:
+                skipped.append({"uid": game_uid, "reason": "Account is paused or offline"})
+                continue
+            if "IN_MATCH" in status:
+                skipped.append({"uid": game_uid, "reason": "Account is already in a match"})
+                continue
+            eligible.append({
+                "uid": game_uid, "auth_uid": auth_uid,
+                "nickname": runtime.get("nickname") or saved_member.get("nickname") or "Account",
+                "peer": peer,
+            })
+        for offset in range(0, len(eligible), TEAM_SIZE):
+            squad = eligible[offset:offset + TEAM_SIZE]
+            if len(squad) != TEAM_SIZE:
+                for item in squad:
+                    skipped.append({"uid": item["uid"], "reason": "Waiting for a full 4-account squad in this clan"})
+                continue
+            prepared.append({"region": region, "clan_id": clan_id,
+                             "members": squad})
+
+    assigned = {item["uid"] for group in prepared for item in group["members"]}
+    for peer_uid in peer_snapshot:
+        if str(peer_uid) not in assigned and not any(str(item.get("uid")) == str(peer_uid) for item in skipped):
+            skipped.append({"uid": str(peer_uid), "reason": "No saved clan/team membership"})
+    return prepared, skipped
+
+def _match_cycle_public_state():
+    groups_out = []
+    for group in _match_cycle_state["groups"].values():
+        member_rows = []
+        for uid in group.get("member_ids", []):
+            account = bot_state.accounts.get(str(uid), {})
+            member_rows.append({
+                "uid": str(uid),
+                "nickname": account.get("nickname") or group.get("nicknames", {}).get(str(uid), "Account"),
+                "status": account.get("status", "OFFLINE"),
+            })
+        groups_out.append({
+            "id": group.get("id"), "clan_id": group.get("clan_id"),
+            "region": group.get("region"), "round": group.get("round"),
+            "status": group.get("status"), "team_code": group.get("team_code"),
+            "leader_uid": group.get("leader_uid"), "members": member_rows,
+            "last_error": group.get("last_error"),
+        })
+    return {"active": bool(_match_cycle_state["active"]),
+            "mode": "battle_royale", "round": _match_cycle_state["round"],
+            "groups": groups_out, "skipped": list(_match_cycle_state["skipped"])}
+
+async def api_match_cycle_status(request):
+    return aiohttp.web.json_response(_match_cycle_public_state())
+
+async def api_match_cycle_start(request):
+    if _match_cycle_state["active"]:
+        return aiohttp.web.json_response({"ok": False, "message": "Battle Royale cycle is already active."}, status=409)
+    if any(group.get("status") == "in_match" for group in _match_cycle_state["groups"].values()):
+        return aiohttp.web.json_response({"ok": False, "message": "Wait for the current squad matches to finish before starting another cycle."}, status=409)
+    async with _team_state["lock"]:
+        peer_snapshot = dict(_team_state["peers"])
+    candidates, skipped = _build_match_cycle_candidates(peer_snapshot)
+    if not candidates:
+        return aiohttp.web.json_response({
+            "ok": False, "message": "No complete clan squads of four are currently connected.",
+            "eligible_accounts": 0, "groups": [], "skipped": skipped,
+        }, status=409)
+    async with _match_cycle_state["lock"]:
+        if _match_cycle_state["active"]:
+            return aiohttp.web.json_response({"ok": False, "message": "Battle Royale cycle is already active."}, status=409)
+        groups = {}
+        uid_to_group = {}
+        next_round = int(_match_cycle_state.get("round", 0)) + 1
+        for index, candidate in enumerate(candidates, start=1):
+            group_id = f"br-{index}"
+            member_ids = [item["uid"] for item in candidate["members"]]
+            group = {
+                "id": group_id, "clan_id": candidate["clan_id"],
+                "region": candidate["region"], "member_ids": member_ids,
+                "nicknames": {item["uid"]: item["nickname"] for item in candidate["members"]},
+                "peers": {item["uid"]: item["peer"] for item in candidate["members"]},
+                "leader_index": 0, "leader_uid": member_ids[0],
+                "team_code": None, "joined": set(), "finished": set(),
+                "match_found": set(), "server_group_id": None,
+                "round": next_round, "attempts": 0, "attempt_started": 0.0,
+                "attempt_id": 0, "status": "forming", "last_error": None,
+            }
+            groups[group_id] = group
+            for uid in member_ids: uid_to_group[uid] = group_id
+        _match_cycle_state["groups"] = groups
+        _match_cycle_state["uid_to_group"] = uid_to_group
+        _match_cycle_state["skipped"] = skipped
+        _match_cycle_state["round"] = next_round
+        _match_cycle_state["active"] = True
+    bot_state.log(f"[BR] Cycle started: {len(candidates)} squad(s), {len(uid_to_group)} account(s)", "success")
+    result = _match_cycle_public_state()
+    return aiohttp.web.json_response({"ok": True,
+        "message": f"Battle Royale cycle started for {len(candidates)} full squad(s).",
+        "eligible_accounts": len(uid_to_group), "groups": result["groups"], "skipped": skipped})
+
+async def api_match_cycle_stop(request):
+    async with _match_cycle_state["lock"]:
+        was_active = _match_cycle_state["active"]
+        _match_cycle_state["active"] = False
+        for group in _match_cycle_state["groups"].values():
+            if group.get("status") != "in_match": group["status"] = "stopping"
+    if was_active: bot_state.log("[BR] Stop requested; current matches may finish, no next round will start", "warning")
+    return aiohttp.web.json_response({"ok": True, "stopping": was_active,
+                                      "message": "Current matches can finish; no new round will start."})
+
 async def api_account_add(request):
     try:
         body = await request.json()
@@ -3446,6 +3742,9 @@ async def start_web_server():
     app.router.add_get("/api/stats", api_stats)
     app.router.add_get("/api/state", api_state)
     app.router.add_get("/api/teams", api_teams)
+    app.router.add_get("/api/match-cycle", api_match_cycle_status)
+    app.router.add_post("/api/match-cycle/start", api_match_cycle_start)
+    app.router.add_post("/api/match-cycle/stop", api_match_cycle_stop)
     app.router.add_get("/api/account/export", api_account_export)
     app.router.add_post("/api/create_team", api_create_team)
     app.router.add_post("/api/account/add", api_account_add)
