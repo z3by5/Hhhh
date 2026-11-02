@@ -1848,8 +1848,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                     if frame:
                         ptype = await classify(frame)
                         if frame['cmd'] in [103, 107]:
-                            completion_reason = "server_end_signal"
-                            print_premium(f"Match #{match_index} SERVER END SIGNAL | elapsed={int(time.time() - match_start_time)}s | UID: {uid_str}", color=PX.MAGENTA, icon=I["star"])
+                            completion_reason = "unverified_terminal_packet"
+                            print_warning(f"Match #{match_index} UNVERIFIED TERMINAL-LIKE PACKET | cmd={frame['cmd']} | not counted as finished | elapsed={int(time.time() - match_start_time)}s | UID: {uid_str}")
                             local_closed = True
                             continue
                         if frame['cmd'] == 101:
@@ -1915,10 +1915,12 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
         if movement_ctrl:
             try: await movement_ctrl.stop()
             except Exception: pass
-        if completion_reason == "server_end_signal":
+        # Only a separately validated, documented game-end event may set this reason.
+        # The observed command IDs 103/107 are deliberately not treated as proof.
+        if completion_reason == "verified_match_end":
             try:
                 bot_state.increment_match(uid_str)
-                print_premium(f"Match #{match_index} SERVER-END EVENT COUNTED | UID: {uid_str}",
+                print_premium(f"Match #{match_index} VERIFIED SERVER-END EVENT COUNTED | UID: {uid_str}",
                               color=PX.GOLD, icon=I["crown"])
                 try: await _mark_bot_match_finished(uid_str)
                 except Exception: pass
