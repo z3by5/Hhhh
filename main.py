@@ -635,6 +635,44 @@ def optimize_udp_socket(sock):
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
     except Exception: pass
 
+async def send_udp_logged(sock, payload, addr, *, uid, operation,
+                          match_index=None, match_started=None):
+    """Send one UDP datagram and log the full local send failure context."""
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.sock_sendto(sock, payload, addr)
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        try:
+            source = sock.getsockname()
+        except Exception:
+            source = "unavailable"
+        try:
+            fd = sock.fileno()
+        except Exception:
+            fd = "unavailable"
+        elapsed = (round(time.monotonic() - match_started, 1)
+                   if match_started is not None else "n/a")
+        msg_key = f"0x{payload[0]:02x}" if payload else "empty"
+        detail = (
+            f"[UDP-SEND-ERROR] uid={uid} operation={operation} "
+            f"match={match_index or 'none'} elapsed_s={elapsed} "
+            f"dst={addr!r} src={source!r} fd={fd} "
+            f"bytes={len(payload) if payload is not None else 0} "
+            f"msg_key={msg_key} exception={type(exc).__name__} "
+            f"errno={getattr(exc, 'errno', None)} "
+            f"winerror={getattr(exc, 'winerror', None)} error={exc!r}\n"
+            f"{traceback.format_exc()}"
+        )
+        print_error(detail)
+        try:
+            bot_state.log(detail, "error")
+        except Exception:
+            pass
+        return False
+
 client = httpx.AsyncClient(verify=False, timeout=15.0,
     limits=httpx.Limits(max_connections=300, max_keepalive_connections=150))
 _LOGIN_SEMAPHORE = asyncio.Semaphore(4)
@@ -946,7 +984,6 @@ class MovementController:
     async def _send_udp(self):
         if not self.udp_sock or not self.udp_server or not self.udp_key: return False
         try:
-            loop = asyncio.get_running_loop()
             self.tick = (self.tick + 1) & 0xFFFF
             self.counter = (self.counter + 1) & 0xFFFF
             p_state = PLAYER_STATE_MAP.get(self.state, 1)
@@ -956,21 +993,40 @@ class MovementController:
                 int(self.x), int(self.y), int(self.z),
                 self.tick, self.counter, m_state,
                 self.account_id, self.match_code or [], phase="game")
-            await loop.sock_sendto(self.udp_sock, pkt, self.udp_server)
-            return True
-        except Exception: return False
+            return await send_udp_logged(
+                self.udp_sock, pkt, self.udp_server, uid=self.account_id,
+                operation="movement", match_index=getattr(self, "match_index", None),
+                match_started=getattr(self, "match_started", None))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            detail = (f"[UDP-BUILD-ERROR] uid={self.account_id} operation=movement "
+                      f"exception={type(exc).__name__} error={exc!r}\n{traceback.format_exc()}")
+            print_error(detail)
+            try: bot_state.log(detail, "error")
+            except Exception: pass
+            return False
 
     async def _send_ping(self):
         if not self.udp_sock or not self.udp_server or not self.udp_key: return
         try:
-            loop = asyncio.get_running_loop()
             nr = (await layouts_from_mask(self.match_code or [1,3,4]))[1]
             ping_pkt = await build_packet(
                 0x6D, nr, 0, 3, None, 0,
                 struct.pack("<I", int(time.time()*1000) & 0xFFFFFFFF) + b"\x00\x00\x00",
                 self.udp_key, encrypted=False)
-            await loop.sock_sendto(self.udp_sock, ping_pkt, self.udp_server)
-        except Exception: pass
+            await send_udp_logged(
+                self.udp_sock, ping_pkt, self.udp_server, uid=self.account_id,
+                operation="movement_ping", match_index=getattr(self, "match_index", None),
+                match_started=getattr(self, "match_started", None))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            detail = (f"[UDP-BUILD-ERROR] uid={self.account_id} operation=movement_ping "
+                      f"exception={type(exc).__name__} error={exc!r}\n{traceback.format_exc()}")
+            print_error(detail)
+            try: bot_state.log(detail, "error")
+            except Exception: pass
 
     async def _do_jump(self):
         old = self.state
@@ -1638,7 +1694,8 @@ async def reply_for(frame, key, mask, ack_key=0x68, ping_key=0x6D, hello_key=0x5
         return typ, await build_packet(ack_key, nr, 0, 2, None, 1, b"\x02\x00", key)
     return typ, None
 
-async def keepalive_ping(sock, ip, port, key_bytes, mask, stop_event):
+async def keepalive_ping(sock, ip, port, key_bytes, mask, stop_event,
+                        uid="unknown", match_index=None, match_started=None):
     nr = (await layouts_from_mask(mask))[1]
     ping_keys = [0x66, 0x6D, 0x69, 0x6C, 0x6B, 0x6E, 0x6F, 0x70]
     loop = asyncio.get_event_loop(); i = 0
@@ -1648,8 +1705,9 @@ async def keepalive_ping(sock, ip, port, key_bytes, mask, stop_event):
         pkt = await build_packet(pk, nr, 0, 3, None, 0,
                                  struct.pack("<I", counter) + b"\x00\x00\x00",
                                  key_bytes, encrypted=False)
-        try: await loop.sock_sendto(sock, pkt, (ip, port))
-        except Exception: pass
+        await send_udp_logged(sock, pkt, (ip, port), uid=uid,
+                              operation="periodic_keepalive",
+                              match_index=match_index, match_started=match_started)
         i += 1
         try: await asyncio.wait_for(stop_event.wait(), timeout=3.0)
         except asyncio.TimeoutError: pass
@@ -1814,19 +1872,27 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
         optimize_udp_socket(sock); sock.setblocking(False)
         udp_key_bytes = bytes.fromhex(udp_key)
         hello_packet = await build_hello_packet(f"{account_id}_2585", udp_key_bytes, match_code)
-        await loop.sock_sendto(sock, bytes.fromhex(hello_packet), (resolved_ip, port))
+        if not await send_udp_logged(
+                sock, bytes.fromhex(hello_packet), (resolved_ip, port), uid=uid_str,
+                operation="initial_hello", match_index=match_index,
+                match_started=match_start_time):
+            raise ConnectionError("initial UDP hello send failed")
         ack_state = "waiting_for_hello_reply"
         thunder_sent = False
         join_match_received = False
         local_closed = False
         send_lock = asyncio.Lock()
-        ping_task = asyncio.create_task(keepalive_ping(sock, resolved_ip, port, udp_key_bytes, match_code, ping_stop))
+        ping_task = asyncio.create_task(keepalive_ping(
+            sock, resolved_ip, port, udp_key_bytes, match_code, ping_stop,
+            uid=uid_str, match_index=match_index, match_started=match_start_time))
         last_activity = time.time()
         movement_ctrl = MovementController(
             account_id=account_id, account_region=player_region,
             key=key, iv=iv, tcp_writer=None,
             udp_sock=sock, udp_server=(resolved_ip, port),
             udp_key_bytes=udp_key_bytes, match_code=match_code)
+        movement_ctrl.match_started = match_start_time
+        movement_ctrl.match_index = match_index
 
         async def send_thunder_sharma_inline():
             nonlocal ack_state, thunder_sent
@@ -1834,14 +1900,26 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
             async with send_lock:
                 if thunder_sent: return
                 try:
-                    await loop.sock_sendto(sock, bytes.fromhex(thunder), (resolved_ip, port))
+                    sent = await send_udp_logged(
+                        sock, bytes.fromhex(thunder), (resolved_ip, port), uid=uid_str,
+                        operation="thunder", match_index=match_index,
+                        match_started=match_start_time)
+                    if not sent: raise ConnectionError("thunder UDP send failed")
                     thunder_sent = True
                     await asyncio.sleep(0.3)
                     prepare_ack = await build_packet(0x68, (await layouts_from_mask(match_code))[1],
                                                      0, 2, None, 1, b"\x01\x00", udp_key_bytes)
-                    await loop.sock_sendto(sock, prepare_ack, (resolved_ip, port))
+                    if not await send_udp_logged(
+                            sock, prepare_ack, (resolved_ip, port), uid=uid_str,
+                            operation="prepare_ack", match_index=match_index,
+                            match_started=match_start_time):
+                        raise ConnectionError("prepare ACK UDP send failed")
                     await asyncio.sleep(0.4)
-                    await loop.sock_sendto(sock, bytes.fromhex(sharma), (resolved_ip, port))
+                    if not await send_udp_logged(
+                            sock, bytes.fromhex(sharma), (resolved_ip, port), uid=uid_str,
+                            operation="sharma", match_index=match_index,
+                            match_started=match_start_time):
+                        raise ConnectionError("sharma UDP send failed")
                     ack_state = "thunder_sharma_sent"
                     print_premium(f"Match #{match_index} Playing in-game!",
                                   color=PX.LIME, icon=I["flame"])
@@ -1871,30 +1949,38 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                             try:
                                 ack = await build_packet(0x68, (await layouts_from_mask(match_code))[1],
                                                          0,2,None,1, b"\x01\x00", udp_key_bytes)
-                                await loop.sock_sendto(sock, ack, server_addr)
-                            except Exception: pass
+                                await send_udp_logged(
+                                    sock, ack, server_addr, uid=uid_str,
+                                    operation="cmd101_ack", match_index=match_index,
+                                    match_started=match_start_time)
+                            except Exception as exc:
+                                detail = (f"[UDP-BUILD-ERROR] uid={uid_str} operation=cmd101_ack "
+                                          f"exception={type(exc).__name__} error={exc!r}\n{traceback.format_exc()}")
+                                print_error(detail)
+                                try: bot_state.log(detail, "error")
+                                except Exception: pass
                             continue
                         if ptype in ["ACK","PING","HELLO","JOIN_MATCH"]:
                             if ptype == "HELLO" and ack_state == "waiting_for_hello_reply":
                                 typ, reply = await reply_for(frame, udp_key_bytes, match_code, ack_style="short")
-                                if reply: await loop.sock_sendto(sock, reply, server_addr)
+                                if reply: await send_udp_logged(sock, reply, server_addr, uid=uid_str, operation="hello_ack", match_index=match_index, match_started=match_start_time)
                                 ack_state = "ack_sent_waiting"
                             elif ptype == "ACK":
                                 if ack_state == "waiting_for_hello_reply":
                                     typ, reply = await reply_for(frame, udp_key_bytes, match_code)
-                                    if reply: await loop.sock_sendto(sock, reply, server_addr)
+                                    if reply: await send_udp_logged(sock, reply, server_addr, uid=uid_str, operation="ack_reply", match_index=match_index, match_started=match_start_time)
                                     ack_state = "ready_to_send_thunder"
                                 elif ack_state == "ack_sent_waiting": ack_state = "ready_to_send_thunder"
                                 else:
                                     typ, reply = await reply_for(frame, udp_key_bytes, match_code)
-                                    if reply: await loop.sock_sendto(sock, reply, server_addr)
+                                    if reply: await send_udp_logged(sock, reply, server_addr, uid=uid_str, operation="ack_reply", match_index=match_index, match_started=match_start_time)
                             elif ptype == "PING":
                                 typ, reply = await reply_for(frame, udp_key_bytes, match_code)
-                                if reply: await loop.sock_sendto(sock, reply, server_addr)
+                                if reply: await send_udp_logged(sock, reply, server_addr, uid=uid_str, operation="ping_reply", match_index=match_index, match_started=match_start_time)
                             elif ptype == "JOIN_MATCH" and not join_match_received:
                                 typ, reply = await reply_for(frame, udp_key_bytes, match_code)
                                 if reply:
-                                    await loop.sock_sendto(sock, reply, server_addr)
+                                    await send_udp_logged(sock, reply, server_addr, uid=uid_str, operation="join_match_ack", match_index=match_index, match_started=match_start_time)
                                     join_match_received = True
             except asyncio.TimeoutError:
                 if ack_state == "ready_to_send_thunder" and not thunder_sent:
@@ -1903,9 +1989,18 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                     if (time.time() - last_activity) > 7.0:
                         try:
                             pkt = await build_hello_packet(f"{account_id}_2585", udp_key_bytes, match_code)
-                            await loop.sock_sendto(sock, bytes.fromhex(pkt), (resolved_ip, port))
-                        except Exception: pass
-                        last_activity = time.time()
+                            await send_udp_logged(
+                                sock, bytes.fromhex(pkt), (resolved_ip, port), uid=uid_str,
+                                operation="hello_retry", match_index=match_index,
+                                match_started=match_start_time)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            detail = (f"[UDP-BUILD-ERROR] uid={uid_str} operation=hello_retry "
+                                      f"exception={type(exc).__name__} error={exc!r}\n{traceback.format_exc()}")
+                            print_error(detail)
+                            try: bot_state.log(detail, "error")
+                            except Exception: pass
                     if (time.time() - match_start_time) > 25.0:
                         completion_reason = "handshake_timeout"
                         print_warning(f"Match #{match_index} INTERRUPTED | reason=handshake_timeout | elapsed={int(time.time() - match_start_time)}s | UID: {uid_str}")
