@@ -1,7 +1,7 @@
-name: Ping Render service (staggered backup)
+name: Ping Render service every 10 minutes
 on:
   schedule:
-    - cron: '4,12,20,28,36,44,52 * * * *'
+    - cron: '5,15,25,35,45,55 * * * *'
   workflow_dispatch:
 permissions:
   contents: read
