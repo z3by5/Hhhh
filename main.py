@@ -1789,6 +1789,13 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
     movement_ctrl = None
     uid_str = str(account_id)
     completion_reason = None
+    completion_counted = False
+    terminal_packet_cmd = None
+    last_activity = match_start_time
+    ack_state = "initializing"
+    thunder_sent = False
+    join_match_received = False
+    exception_type = None
     try:
         ip, port = server_ip_port.split(":")
         port = int(port)
@@ -1849,6 +1856,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                         ptype = await classify(frame)
                         if frame['cmd'] in [103, 107]:
                             completion_reason = "unverified_terminal_packet"
+                            terminal_packet_cmd = frame['cmd']
                             print_warning(f"Match #{match_index} UNVERIFIED TERMINAL-LIKE PACKET | cmd={frame['cmd']} | not counted as finished | elapsed={int(time.time() - match_start_time)}s | UID: {uid_str}")
                             local_closed = True
                             continue
@@ -1909,6 +1917,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
         return f"match #{match_index} finished"
     except Exception as e:
         completion_reason = "exception"
+        exception_type = type(e).__name__
         print_error(f"Match #{match_index} {e}")
         return f"match #{match_index} error"
     finally:
@@ -1920,6 +1929,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
         if completion_reason == "verified_match_end":
             try:
                 bot_state.increment_match(uid_str)
+                completion_counted = True
                 print_premium(f"Match #{match_index} VERIFIED SERVER-END EVENT COUNTED | UID: {uid_str}",
                               color=PX.GOLD, icon=I["crown"])
                 try: await _mark_bot_match_finished(uid_str)
@@ -1934,6 +1944,19 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
             except Exception: pass
         elif completion_reason:
             bot_state.log(f"[MATCH] {match_index} not counted as finished | reason={completion_reason} | UID={uid_str}", "warning")
+        end_reason = completion_reason or "cancelled_or_unclassified"
+        elapsed_seconds = max(0, int(time.time() - match_start_time))
+        inbound_idle_seconds = max(0, int(time.time() - last_activity))
+        log_level = "success" if completion_counted else "warning"
+        session_end_log = (
+            f"[SESSION-END] match={match_index} uid={uid_str} reason={end_reason} "
+            f"elapsed_s={elapsed_seconds} inbound_idle_s={inbound_idle_seconds} "
+            f"ack_state={ack_state} thunder_sent={thunder_sent} "
+            f"join_match_received={join_match_received} terminal_cmd={terminal_packet_cmd or 'none'} "
+            f"completion_counted={completion_counted} exception_type={exception_type or 'none'}"
+        )
+        bot_state.log(session_end_log, log_level)
+        print(session_end_log)
         ping_stop.set()
         if ping_task:
             ping_task.cancel()
