@@ -1400,13 +1400,20 @@ def _create_clan_payload(clan_id):
     except Exception as e:
         print_error(f"CLAN payload: {e}"); return None
 
-async def join_clan(jwt_token, clan_id):
+async def join_clan(jwt_token, clan_id, server_url=None):
     if not _CLAN_PB_AVAILABLE: return False
     try:
         region = _get_region_from_jwt(jwt_token)
-        base_url = _get_region_url(region)
+        # The game login response supplies the account's active API endpoint.
+        # Prefer it over the legacy static host mapping, which may no longer resolve.
+        base_url = str(server_url or "").strip().rstrip("/")
+        if not base_url:
+            base_url = _get_region_url(region).rstrip("/")
+        if not base_url.startswith("https://"):
+            print_error("CLAN invalid server_url; expected an HTTPS game API endpoint")
+            return False
         url = base_url.rstrip("/") + "/RequestJoinClan"
-        host = base_url.replace("https://","")
+        host = base_url.split("://", 1)[-1].split("/", 1)[0]
         payload = _create_clan_payload(clan_id)
         if not payload: return False
         hdrs = {"Authorization":f"Bearer {jwt_token}",
@@ -2742,7 +2749,8 @@ async def run_account_worker(ad, label, region_override=None, clan_override=None
         if clan_override:
             try:
                 await asyncio.sleep(1.0)
-                accepted = await join_clan(ad['token'], clan_override)
+                accepted = await join_clan(ad['token'], clan_override,
+                                           ad.get('server_url'))
                 _record_clan_request(label, bool(accepted))
             except Exception:
                 _record_clan_request(label, False)
