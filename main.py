@@ -69,6 +69,7 @@ START_MATCH_INTERVAL = 3.0
 NEW_MATCH_DELAY = 2.0
 MAX_MATCH_DURATION = 1500
 MATCH_IDLE_TIMEOUT  = 35.0
+MIN_MATCH_DURATION = 900.0
 
 NO_MATCH_RESTART_ENABLED  = False
 NO_MATCH_RESTART_TIMEOUT  = 90.0
@@ -1857,6 +1858,12 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
     completion_counted = False
     terminal_packet_cmd = None
     last_activity = match_start_time
+    game_started_at = None
+    received_datagrams = 0
+    last_inbound_addr = None
+    receive_error_count = 0
+    last_receive_error_log = 0.0
+    next_idle_diagnostic = match_start_time + 60.0
     ack_state = "initializing"
     thunder_sent = False
     join_match_received = False
@@ -1895,7 +1902,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
         movement_ctrl.match_index = match_index
 
         async def send_thunder_sharma_inline():
-            nonlocal ack_state, thunder_sent
+            nonlocal ack_state, thunder_sent, game_started_at
             if thunder_sent: return
             async with send_lock:
                 if thunder_sent: return
@@ -1921,6 +1928,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                             match_started=match_start_time):
                         raise ConnectionError("sharma UDP send failed")
                     ack_state = "thunder_sharma_sent"
+                    game_started_at = time.time()
                     print_premium(f"Match #{match_index} Playing in-game!",
                                   color=PX.LIME, icon=I["flame"])
                     movement_ctrl.start()
@@ -1936,6 +1944,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                 response, server_addr = await asyncio.wait_for(loop.sock_recvfrom(sock, 65535), timeout=2.0)
                 if response:
                     last_activity = time.time()
+                    received_datagrams += 1
+                    last_inbound_addr = server_addr
                     frame = await decode_packet(response, udp_key_bytes, match_code)
                     if frame:
                         ptype = await classify(frame)
@@ -2006,13 +2016,56 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                         print_warning(f"Match #{match_index} INTERRUPTED | reason=handshake_timeout | elapsed={int(time.time() - match_start_time)}s | UID: {uid_str}")
                         break
                 elif ack_state == "thunder_sharma_sent":
-                    if (time.time() - last_activity) > MATCH_IDLE_TIMEOUT:
-                        completion_reason = "inbound_idle_timeout"
-                        print_warning(f"Match #{match_index} INTERRUPTED | reason=inbound_idle_timeout | no_inbound={int(time.time() - last_activity)}s | elapsed={int(time.time() - match_start_time)}s | UID: {uid_str}")
-                        break
-            except (BlockingIOError, OSError):
+                    now = time.time()
+                    idle_seconds = now - last_activity
+                    game_elapsed = now - (game_started_at or match_start_time)
+                    if idle_seconds > MATCH_IDLE_TIMEOUT:
+                        if game_elapsed >= MIN_MATCH_DURATION:
+                            completion_reason = "inbound_idle_timeout"
+                            print_warning(
+                                f"Match #{match_index} INTERRUPTED | reason=inbound_idle_timeout "
+                                f"| no_inbound={int(idle_seconds)}s | game_elapsed={int(game_elapsed)}s "
+                                f"| received_datagrams={received_datagrams} | last_inbound={last_inbound_addr!r} "
+                                f"| recv_errors={receive_error_count} | UID: {uid_str}")
+                            break
+                        if now >= next_idle_diagnostic:
+                            bot_state.log(
+                                f"[UDP-INBOUND-IDLE] match={match_index} uid={uid_str} "
+                                f"game_elapsed_s={int(game_elapsed)} idle_s={int(idle_seconds)} "
+                                f"min_match_s={int(MIN_MATCH_DURATION)} received_datagrams={received_datagrams} "
+                                f"last_inbound={last_inbound_addr!r} recv_errors={receive_error_count}; "
+                                "holding session until minimum match duration",
+                                "warning")
+                            next_idle_diagnostic = now + 60.0
+            except (BlockingIOError, OSError) as exc:
+                if not isinstance(exc, BlockingIOError):
+                    receive_error_count += 1
+                    now = time.monotonic()
+                    if now - last_receive_error_log >= 30.0:
+                        detail = (
+                            f"[UDP-RECV-ERROR] uid={uid_str} match={match_index} "
+                            f"elapsed_s={int(time.time() - match_start_time)} "
+                            f"idle_s={int(time.time() - last_activity)} count={receive_error_count} "
+                            f"exception={type(exc).__name__} errno={getattr(exc, 'errno', None)} "
+                            f"error={exc!r}\n{traceback.format_exc()}")
+                        print_error(detail)
+                        try: bot_state.log(detail, "error")
+                        except Exception: pass
+                        last_receive_error_log = now
                 await asyncio.sleep(0.5); continue
-            except Exception:
+            except Exception as exc:
+                receive_error_count += 1
+                now = time.monotonic()
+                if now - last_receive_error_log >= 30.0:
+                    detail = (
+                        f"[UDP-LOOP-ERROR] uid={uid_str} match={match_index} "
+                        f"elapsed_s={int(time.time() - match_start_time)} "
+                        f"idle_s={int(time.time() - last_activity)} count={receive_error_count} "
+                        f"exception={type(exc).__name__} error={exc!r}\n{traceback.format_exc()}")
+                    print_error(detail)
+                    try: bot_state.log(detail, "error")
+                    except Exception: pass
+                    last_receive_error_log = now
                 await asyncio.sleep(0.5); continue
             if ack_state == "ready_to_send_thunder" and not thunder_sent:
                 await send_thunder_sharma_inline()
@@ -2053,6 +2106,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
         session_end_log = (
             f"[SESSION-END] match={match_index} uid={uid_str} reason={end_reason} "
             f"elapsed_s={elapsed_seconds} inbound_idle_s={inbound_idle_seconds} "
+            f"received_datagrams={received_datagrams} last_inbound={last_inbound_addr!r} "
+            f"recv_errors={receive_error_count} "
             f"ack_state={ack_state} thunder_sent={thunder_sent} "
             f"join_match_received={join_match_received} terminal_cmd={terminal_packet_cmd or 'none'} "
             f"completion_counted={completion_counted} exception_type={exception_type or 'none'}"
