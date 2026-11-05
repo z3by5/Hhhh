@@ -70,6 +70,7 @@ NEW_MATCH_DELAY = 2.0
 MAX_MATCH_DURATION = 1500
 MATCH_IDLE_TIMEOUT  = 35.0
 MIN_MATCH_DURATION = 900.0
+MATCH_ENTRY_CONFIRM_TIMEOUT = 120.0
 
 NO_MATCH_RESTART_ENABLED  = False
 NO_MATCH_RESTART_TIMEOUT  = 90.0
@@ -295,6 +296,11 @@ class BotState:
             "gained_exp": existing.get("gained_exp", 0),
             "matches": existing.get("matches", 0),
             "active_matches": 0,
+            "status_updated_at": time.time(),
+            "match_attempt_id": None,
+            "match_connection_started_at": None,
+            "match_server_response_at": None,
+            "match_entry_confirmed_at": None,
             "uptime_seconds": existing.get("uptime_seconds", 0),
             "last_match_time": existing.get("last_match_time", "Running..."),
             "is_paused": False,
@@ -303,9 +309,63 @@ class BotState:
     def update_status(self, uid, status, matches=0):
         uid = str(uid)
         if uid in self.accounts:
-            self.accounts[uid]["status"] = status
-            self.accounts[uid]["active_matches"] = matches
-            self.accounts[uid]["is_paused"] = (status == "PAUSED")
+            account = self.accounts[uid]
+            if account.get("status") != status:
+                account["status_updated_at"] = time.time()
+            account["status"] = status
+            account["active_matches"] = matches
+            account["is_paused"] = (status == "PAUSED")
+            if status not in {"SERVER_RESPONDING", "ENTRY_UNCONFIRMED", "IN_MATCH_CONFIRMED"}:
+                account["match_attempt_id"] = None
+                account["match_connection_started_at"] = None
+                account["match_server_response_at"] = None
+                account["match_entry_confirmed_at"] = None
+
+    def begin_match_attempt(self, uid, attempt_id):
+        uid = str(uid)
+        account = self.accounts.get(uid)
+        if not account:
+            return False
+        now = time.time()
+        account.update({
+            "status": "CONNECTING", "active_matches": 0,
+            "status_updated_at": now, "match_attempt_id": str(attempt_id),
+            "match_connection_started_at": now,
+            "match_server_response_at": None,
+            "match_entry_confirmed_at": None,
+            "is_paused": False,
+        })
+        self.log(f"[MATCH-STATUS] uid={uid} state=CONNECTING attempt={attempt_id}", "info")
+        return True
+
+    def mark_match_server_responding(self, uid, attempt_id):
+        uid = str(uid)
+        account = self.accounts.get(uid)
+        if not account or account.get("match_attempt_id") != str(attempt_id):
+            return False
+        if account.get("status") not in {"CONNECTING", "SERVER_RESPONDING"}:
+            return False
+        if account.get("match_server_response_at") is None:
+            now = time.time()
+            account["status"] = "SERVER_RESPONDING"
+            account["active_matches"] = 0
+            account["status_updated_at"] = now
+            account["match_server_response_at"] = now
+            self.log(f"[MATCH-STATUS] uid={uid} state=SERVER_RESPONDING entry=unconfirmed attempt={attempt_id}", "info")
+        return True
+
+    def mark_match_entry_unconfirmed(self, uid, attempt_id, elapsed_seconds):
+        uid = str(uid)
+        account = self.accounts.get(uid)
+        if not account or account.get("match_attempt_id") != str(attempt_id):
+            return False
+        if account.get("status") not in {"CONNECTING", "SERVER_RESPONDING"}:
+            return False
+        account["status"] = "ENTRY_UNCONFIRMED"
+        account["active_matches"] = 0
+        account["status_updated_at"] = time.time()
+        self.log(f"[MATCH-STATUS] uid={uid} state=ENTRY_UNCONFIRMED elapsed_s={int(elapsed_seconds)} attempt={attempt_id}; no verified entry signal", "warning")
+        return True
 
     def update_exp(self, uid, exp, level=None):
         uid = str(uid)
@@ -368,7 +428,7 @@ def _match_cycle_group_for_uid(uid):
 def _match_cycle_all_groups_ready():
     groups = list(_match_cycle_state["groups"].values())
     return bool(_match_cycle_state["active"] and groups and
-                all(g.get("status") in {"accept_packets_sent", "searching", "in_match", "round_finished"} for g in groups))
+                all(g.get("status") in {"accept_packets_sent", "searching", "connecting", "in_match", "round_finished"} for g in groups))
 
 async def _mark_bot_match_finished(account_id):
     uid = str(account_id)
@@ -459,8 +519,23 @@ def _all_bots_are_online_or_searching() -> bool:
 
 def _any_bot_in_match() -> bool:
     for uid, acc in bot_state.accounts.items():
-        if "IN_MATCH" in str(acc.get("status", "")).upper(): return True
+        if str(acc.get("status", "")).upper() == "IN_MATCH_CONFIRMED": return True
     return False
+
+async def _match_entry_watchdog():
+    print_info(f"[MATCH-STATUS] entry verification timeout={MATCH_ENTRY_CONFIRM_TIMEOUT:.0f}s")
+    while True:
+        await asyncio.sleep(5.0)
+        now = time.time()
+        for uid, account in list(bot_state.accounts.items()):
+            status = str(account.get("status", "")).upper()
+            attempt_id = account.get("match_attempt_id")
+            started_at = account.get("match_connection_started_at")
+            if not attempt_id or status not in {"CONNECTING", "SERVER_RESPONDING"} or not started_at:
+                continue
+            elapsed = now - float(started_at)
+            if elapsed >= MATCH_ENTRY_CONFIRM_TIMEOUT:
+                bot_state.mark_match_entry_unconfirmed(uid, attempt_id, elapsed)
 
 async def _no_match_watchdog():
     if not NO_MATCH_RESTART_ENABLED: return
@@ -1848,12 +1923,14 @@ def cache_invalidate(uid):
 
 # ==================== PLAY GAME ====================
 async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
-                    account_id, player_region, client_version, key, iv, match_index):
+                    account_id, player_region, client_version, key, iv, match_index,
+                    attempt_id=None, status_uid=None):
     match_start_time = time.time()
     ping_task = None; sock = None
     ping_stop = asyncio.Event()
     movement_ctrl = None
     uid_str = str(account_id)
+    status_uid_str = str(status_uid or account_id)
     completion_reason = None
     completion_counted = False
     terminal_packet_cmd = None
@@ -1929,7 +2006,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                         raise ConnectionError("sharma UDP send failed")
                     ack_state = "thunder_sharma_sent"
                     game_started_at = time.time()
-                    print_premium(f"Match #{match_index} Playing in-game!",
+                    print_premium(f"Match #{match_index} startup packets sent; awaiting verified game-entry signal",
                                   color=PX.LIME, icon=I["flame"])
                     movement_ctrl.start()
                 except Exception as e:
@@ -1948,6 +2025,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                     last_inbound_addr = server_addr
                     frame = await decode_packet(response, udp_key_bytes, match_code)
                     if frame:
+                        if attempt_id:
+                            bot_state.mark_match_server_responding(status_uid_str, attempt_id)
                         ptype = await classify(frame)
                         if frame['cmd'] in [103, 107]:
                             completion_reason = "unverified_terminal_packet"
@@ -2123,7 +2202,9 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
             try: sock.close()
             except Exception: pass
         remaining = await _dec_match(uid_str)
-        try: bot_state.update_status(uid_str, "ONLINE" if remaining == 0 else "IN_MATCH", remaining)
+        try:
+            if remaining == 0:
+                bot_state.update_status(status_uid_str, "ONLINE", 0)
         except Exception: pass
 
 # ==================== FUNCTIONAL LONE WOLF ====================
@@ -2590,8 +2671,8 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                         if cycle_group is not None and _match_cycle_state["active"]:
                             cycle_group.setdefault("match_found", set()).add(uid_str)
                             if set(cycle_group["member_ids"]).issubset(cycle_group["match_found"]):
-                                cycle_group["status"] = "in_match"
-                                bot_state.log(f"[BR] {cycle_group['id']} all squad accounts entered round {cycle_group['round']}", "success")
+                                cycle_group["status"] = "connecting"
+                                bot_state.log(f"[BR] {cycle_group['id']} all squad accounts received match assignments for round {cycle_group['round']}; entry is not yet confirmed", "info")
                         try: await _mark_match_found(uid_str)
                         except Exception: pass
                         try: await _clear_team_joined(uid_str)
@@ -2624,15 +2705,17 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                     mode_id=1, map_id=1)
                                 match_index = await _inc_match(uid_str)
                                 print_info(f"Match #{match_index} → {server_ip_port}")
+                                attempt_id = f"{uid_str}:{match_index}:{time.time_ns()}"
                                 try:
                                     bot_state.increment_match_started()
-                                    bot_state.update_status(uid_str, "IN_MATCH (TEAM)", 1)
+                                    bot_state.begin_match_attempt(uid_str, attempt_id)
                                 except Exception: pass
                                 new_match = asyncio.create_task(
                                     play_game(server_ip_port, thunder, sharma, udp_key,
                                               match_code, effective_acc_id, "ID",
                                               client_version, current_key, current_iv,
-                                              match_index=match_index))
+                                              match_index=match_index, attempt_id=attempt_id,
+                                              status_uid=uid_str))
                                 play_matches.append(new_match)
 
                                 async def drain_gw():
@@ -2685,7 +2768,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                 cycle_group = _match_cycle_group_for_uid(uid_str)
                 if cycle_group is not None:
                     cycle_group.get("peers", {}).pop(uid_str, None)
-                    if _match_cycle_state["active"] and cycle_group.get("status") not in {"in_match", "round_finished"}:
+                    if _match_cycle_state["active"] and cycle_group.get("status") not in {"connecting", "in_match", "round_finished"}:
                         cycle_group["joined"] = {uid for uid in cycle_group.get("joined", set()) if uid != uid_str}
                         cycle_group["status"] = "forming"
                         cycle_group["last_error"] = f"Account {uid_str} disconnected; waiting for reconnect"
@@ -3294,7 +3377,8 @@ async def api_ping(request):
 _PRIVATE_ACCOUNT_FIELDS = {
     "token", "access_token", "auth_token", "auth_password", "password",
     "auth_uid", "open_id", "aes_ak", "iv_i", "login_payload_data",
-    "functional_addrs", "informational_addrs",
+    "functional_addrs", "informational_addrs", "match_attempt_id",
+    "match_connection_started_at", "match_server_response_at", "match_entry_confirmed_at",
 }
 
 def _public_account_view(account):
@@ -3304,7 +3388,8 @@ def _public_account_view(account):
 async def api_stats(request):
     try:
         accs = [_public_account_view(a) for a in bot_state.accounts.values()]
-        online = sum(1 for a in accs if a.get("status") in ("ONLINE","IN_MATCH","SEARCHING"))
+        online_statuses = {"ONLINE", "SEARCHING", "CONNECTING", "SERVER_RESPONDING", "ENTRY_UNCONFIRMED", "IN_MATCH_CONFIRMED"}
+        online = sum(1 for a in accs if str(a.get("status", "")).upper() in online_statuses)
         active_matches = sum(a.get("active_matches", 0) for a in accs)
         uptime = max(1, int(time.time() - bot_state.start_time))
         uptime_h = max(0.016, uptime / 3600.0)
@@ -3521,8 +3606,8 @@ def _build_match_cycle_candidates(peer_snapshot):
             if bot_state.is_paused(game_uid) or status in {"PAUSED", "OFFLINE", "ERROR"}:
                 skipped.append({"uid": game_uid, "reason": "Account is paused or offline"})
                 continue
-            if "IN_MATCH" in status:
-                skipped.append({"uid": game_uid, "reason": "Account is already in a match"})
+            if status in {"IN_MATCH", "IN_MATCH (TEAM)", "IN_MATCH_CONFIRMED", "CONNECTING", "SERVER_RESPONDING", "ENTRY_UNCONFIRMED"}:
+                skipped.append({"uid": game_uid, "reason": "Account has an active or unconfirmed match connection"})
                 continue
             eligible.append({
                 "uid": game_uid, "auth_uid": auth_uid,
@@ -3572,7 +3657,7 @@ async def api_match_cycle_status(request):
 async def api_match_cycle_start(request):
     if _match_cycle_state["active"]:
         return aiohttp.web.json_response({"ok": False, "message": "Battle Royale cycle is already active."}, status=409)
-    if any(group.get("status") == "in_match" for group in _match_cycle_state["groups"].values()):
+    if any(group.get("status") in {"connecting", "entry_unconfirmed", "in_match"} for group in _match_cycle_state["groups"].values()):
         return aiohttp.web.json_response({"ok": False, "message": "Wait for the current squad matches to finish before starting another cycle."}, status=409)
     async with _team_state["lock"]:
         peer_snapshot = dict(_team_state["peers"])
@@ -3620,7 +3705,7 @@ async def api_match_cycle_stop(request):
         was_active = _match_cycle_state["active"]
         _match_cycle_state["active"] = False
         for group in _match_cycle_state["groups"].values():
-            if group.get("status") != "in_match": group["status"] = "stopping"
+            if group.get("status") not in {"connecting", "entry_unconfirmed", "in_match"}: group["status"] = "stopping"
     if was_active: bot_state.log("[BR] Stop requested; current matches may finish, no next round will start", "warning")
     return aiohttp.web.json_response({"ok": True, "stopping": was_active,
                                       "message": "Current matches can finish; no new round will start."})
@@ -3976,6 +4061,7 @@ async def main():
     except Exception as e:
         print_error(f"BOOT autoload failed: {e}")
     asyncio.create_task(_no_match_watchdog())
+    asyncio.create_task(_match_entry_watchdog())
     print_rule("RAFIN TxT · Premium · All Systems Online", color=PX.EMERALD)
     try:
         while True:

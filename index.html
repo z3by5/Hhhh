@@ -213,7 +213,7 @@ button{cursor:pointer;background:none;border:0}
         </div>
         <div class="stats">
           <div class="stat glow"><div class="stat-top"><div class="stat-icon"><i class="fa-solid fa-users"></i></div><div class="stat-label">Active accounts</div></div><div class="stat-val" id="stat-accounts">0</div><div class="stat-foot" id="stat-online">0 Online</div></div>
-          <div class="stat glow"><div class="stat-top"><div class="stat-icon"><i class="fa-solid fa-rocket"></i></div><div class="stat-label">Matches started</div></div><div class="stat-val" id="stat-started">0</div><div class="stat-foot" id="stat-per-hour">~0 / hour</div></div>
+          <div class="stat glow"><div class="stat-top"><div class="stat-icon"><i class="fa-solid fa-rocket"></i></div><div class="stat-label">Match assignments</div></div><div class="stat-val" id="stat-started">0</div><div class="stat-foot" id="stat-per-hour">~0 / hour</div></div>
           <div class="stat glow"><div class="stat-top"><div class="stat-icon"><i class="fa-solid fa-gamepad"></i></div><div class="stat-label">Matches done</div></div><div class="stat-val" id="stat-completed">0</div><div class="stat-foot" id="stat-active-matches">0 Active</div></div>
           <div class="stat glow"><div class="stat-top"><div class="stat-icon"><i class="fa-solid fa-fire-flame-curved"></i></div><div class="stat-label">Total EXP</div></div><div class="stat-val" id="stat-exp">+0</div><div class="stat-foot" id="stat-exp-rate">~0 EXP/hr</div></div>
           <div class="stat glow"><div class="stat-top"><div class="stat-icon"><i class="fa-solid fa-clock"></i></div><div class="stat-label">Uptime</div></div><div class="stat-val" id="stat-uptime">00:00:00</div><div class="stat-foot">Command Center running</div></div>
@@ -704,13 +704,28 @@ $("btnPauseAll").addEventListener("click", () => guard("pauseAll", async () => {
 const CAT = {paused:{cls:"s-paused",icon:"fa-pause"}, match:{cls:"s-match",icon:"fa-crosshairs"}, online:{cls:"s-online",icon:"fa-globe"}, search:{cls:"s-search",icon:"fa-magnifying-glass"}, error:{cls:"s-error",icon:"fa-triangle-exclamation"}};
 function nodeCategory(a){
   if(a.is_paused || a.status === "PAUSED") return "paused";
-  const s = a.status || "ONLINE";
-  return s === "IN_MATCH" ? "match" : s === "ONLINE" ? "online" : s === "SEARCHING" ? "search" : "error";
+  const s = String(a.status || "ONLINE").toUpperCase();
+  if(s === "IN_MATCH_CONFIRMED") return "match";
+  if(s === "ONLINE") return "online";
+  if(["SEARCHING", "MATCH_FOUND", "CONNECTING", "SERVER_RESPONDING"].includes(s)) return "search";
+  return "error";
 }
 function fmtDur(sec){
   sec = Math.max(0, Math.floor(Number(sec) || 0));
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60, p = n => String(n).padStart(2,"0");
   return h > 0 ? `${h}h ${p(m)}m` : `${p(m)}m ${p(s)}s`;
+}
+function nodeStatusText(acc, cat){
+  if(cat === "paused") return "PAUSED";
+  const s = String(acc.status || "ONLINE").toUpperCase();
+  if(s === "IN_MATCH_CONFIRMED") return `IN MATCH CONFIRMED (${acc.active_matches || 1})`;
+  return ({
+    CONNECTING:"CONNECTING · ENTRY NOT VERIFIED",
+    SERVER_RESPONDING:"SERVER RESPONDING · ENTRY NOT VERIFIED",
+    ENTRY_UNCONFIRMED:"ENTRY UNCONFIRMED",
+    "IN_MATCH":"UNVERIFIED MATCH STATE",
+    "IN_MATCH (TEAM)":"TEAM STATE · ENTRY UNCONFIRMED"
+  })[s] || s;
 }
 function nodeHTML(acc, uid, c){
   const i = CAT[c.cat];
@@ -778,7 +793,7 @@ function renderAccounts(accounts, force){
     const needed = Math.max(1, target - baseExp), curExp = Number(acc.current_exp || 0);
     const earned = Math.max(0, curExp - baseExp), remaining = Math.max(0, target - curExp);
     const pct = isMax ? 100 : Math.min(100, Math.max(0, earned / needed * 100));
-    const stText = cat === "paused" ? "PAUSED" : cat === "match" ? `IN MATCH (${acc.active_matches || 1})` : cat === "error" ? (acc.status || "ERROR") : (acc.status || "ONLINE");
+    const stText = nodeStatusText(acc, cat);
     const c = {level, nextLvl, isMax, curExp, earned, needed, remaining, pct, cat, stText};
     let card = $("acc-" + uid);
     if(!card){ card = document.createElement("div"); card.id = "acc-" + uid; card.className = "node glow"; }
@@ -882,7 +897,7 @@ function renderOverview(d){
   setText("stat-completed", d.total_matches || 0);
   setText("stat-exp", "+" + Number(d.total_gained_exp || 0).toLocaleString());
   setText("stat-active-matches", (d.total_active_matches || 0) + " Active");
-  setText("stat-online", accs.filter(a => !(a.is_paused || a.status === "PAUSED") && (a.status === "ONLINE" || a.status === "IN_MATCH")).length + " Online");
+  setText("stat-online", accs.filter(a => !(a.is_paused || a.status === "PAUSED") && ["ONLINE","SEARCHING","MATCH_FOUND","CONNECTING","SERVER_RESPONDING","ENTRY_UNCONFIRMED","IN_MATCH_CONFIRMED"].includes(String(a.status || "").toUpperCase())).length + " Online");
   const upH = Math.max(0.016, (Number(d.uptime) || 60) / 3600);
   setText("stat-per-hour", "~" + Math.round((d.total_matches_started || 0) / upH) + " / hour");
   setText("stat-exp-rate", "~" + Number(d.exp_per_hour || 0).toLocaleString() + " EXP/hr");
@@ -917,7 +932,11 @@ function teamBadge(label, cls){
 function teamRuntimeState(value){
   const state = String(value || "OFFLINE").toUpperCase();
   if(state === "ONLINE") return ["Online", "s-online"];
-  if(state === "IN_MATCH") return ["In match", "s-match"];
+  if(state === "IN_MATCH_CONFIRMED") return ["In match · confirmed", "s-match"];
+  if(state === "IN_MATCH" || state === "IN_MATCH (TEAM)") return ["Match entry unconfirmed", "s-error"];
+  if(state === "CONNECTING") return ["Connecting · entry unverified", "s-search"];
+  if(state === "SERVER_RESPONDING") return ["Server responding · entry unverified", "s-search"];
+  if(state === "ENTRY_UNCONFIRMED") return ["Entry unconfirmed", "s-error"];
   if(state === "SEARCHING") return ["Searching", "s-search"];
   if(state === "PAUSED") return ["Paused", "s-paused"];
   if(state === "ERROR") return ["Error", "s-error"];
@@ -1046,7 +1065,9 @@ function renderMatchCycle(data){
   const cycleStatusLabels = {
     forming: "Forming squad", inviting: "Sending invitations",
     accept_packets_sent: "Invite accept packets sent; membership not server-confirmed",
-    searching: "Searching for match", in_match: "In match",
+    searching: "Searching for match", connecting: "Connecting to game server; entry unconfirmed",
+    in_match: "In match (server entry not confirmed)",
+    entry_unconfirmed: "Entry unconfirmed; check game client",
     round_finished: "Round finished; waiting for other squads",
     failed: "Formation failed", stopping: "Stopping", stopped: "Stopped"
   };
