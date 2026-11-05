@@ -719,6 +719,7 @@ function nodeStatusText(acc, cat){
   if(cat === "paused") return "PAUSED";
   const s = String(acc.status || "ONLINE").toUpperCase();
   if(s === "IN_MATCH_CONFIRMED") return `IN MATCH CONFIRMED (${acc.active_matches || 1})`;
+  if(acc.reconnect_state === "attempting") return `RECONNECTING · ${s}`;
   return ({
     CONNECTING:"CONNECTING · ENTRY NOT VERIFIED",
     SERVER_RESPONDING:"SERVER RESPONDING · ENTRY NOT VERIFIED",
@@ -745,6 +746,7 @@ function nodeHTML(acc, uid, c){
     <div class="metric"><span>Current</span><strong>${c.curExp.toLocaleString()}</strong></div>
     <div class="metric gain"><span>Gained</span><strong>+${Number(acc.gained_exp || 0).toLocaleString()}</strong></div>
   </div>
+  <div class="team-note">Reconnect: ${Number(acc.reconnect_attempts || 0)} attempts · ${Number(acc.reconnect_successes || 0)} recovered · ${Number(acc.reconnect_failures || 0)} failed${acc.reconnect_state === "attempting" ? " · in progress" : ""}</div>
   <div>
     <div class="prog-top"><span>Lv ${c.level}</span><span>${c.isMax ? "Max level" : c.remaining.toLocaleString() + " EXP left"}</span><span>Lv ${c.nextLvl}</span></div>
     <div class="track"><div class="fill" style="width:${c.pct.toFixed(1)}%"></div></div>
@@ -799,7 +801,8 @@ function renderAccounts(accounts, force){
     if(!card){ card = document.createElement("div"); card.id = "acc-" + uid; card.className = "node glow"; }
     if(card.parentNode !== box) box.appendChild(card);
     Object.assign(card.dataset, {uid, nick: acc.nickname || "", status: cat, paused: cat === "paused" ? "1" : "0", auth: acc.auth_uid || ""});
-    const sig = [level, acc.nickname, acc.region, stText, cat, acc.initial_exp, curExp, acc.gained_exp].join("|");
+    const sig = [level, acc.nickname, acc.region, stText, cat, acc.initial_exp, curExp, acc.gained_exp,
+      acc.reconnect_attempts, acc.reconnect_successes, acc.reconnect_failures, acc.reconnect_state].join("|");
     if(force || card._sig !== sig){ card.innerHTML = nodeHTML(acc, uid, c); card._sig = sig; }
     const tm = card.querySelector(".acc-time");
     if(tm){ tm.dataset.uptime = Math.floor(acc.uptime_seconds || 0); tm.dataset.paused = cat === "paused" ? "1" : "0"; tm.textContent = fmtDur(acc.uptime_seconds || 0); }
@@ -942,6 +945,12 @@ function teamRuntimeState(value){
   if(state === "ERROR") return ["Error", "s-error"];
   return ["Offline", "s-paused"];
 }
+function teamReconnectLabel(member){
+  const attempts = Number(member.reconnect_attempts || 0);
+  const successes = Number(member.reconnect_successes || 0);
+  const failures = Number(member.reconnect_failures || 0);
+  return `Reconnect: ${attempts} attempts · ${successes} recovered · ${failures} failed${member.reconnect_state === "attempting" ? " · in progress" : ""}`;
+}
 function teamClanState(value){
   const state = String(value || "unknown").toLowerCase();
   if(state === "request_accepted") return ["Request accepted · membership unverified", "s-online"];
@@ -997,11 +1006,15 @@ function renderTeams(payload){
       const uid = document.createElement("div"); uid.className = "team-member-uid";
       uid.textContent = "UID: " + String(member.uid || "—");
       identity.append(name, uid);
-      const runtime = teamRuntimeState(member.status);
+      const runtime = member.reconnect_state === "attempting"
+        ? [`Reconnecting · ${String(member.status || "Offline")}`, "s-search"]
+        : teamRuntimeState(member.status);
       rowHead.append(identity, teamBadge(runtime[0], runtime[1]));
       const tags = document.createElement("div"); tags.className = "team-member-status";
       const clan = teamClanState(member.clan_status);
       tags.append(teamBadge("Clan: " + clan[0], clan[1]));
+      const reconnectClass = member.reconnect_state === "attempting" ? "s-search" : Number(member.reconnect_failures || 0) ? "s-error" : "s-paused";
+      tags.append(teamBadge(teamReconnectLabel(member), reconnectClass));
       row.append(rowHead, tags); rows.append(row);
     }
     card.append(rows);

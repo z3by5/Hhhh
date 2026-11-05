@@ -71,6 +71,10 @@ MAX_MATCH_DURATION = 1500
 MATCH_IDLE_TIMEOUT  = 35.0
 MIN_MATCH_DURATION = 900.0
 MATCH_ENTRY_CONFIRM_TIMEOUT = 120.0
+ENTRY_RECONNECT_GRACE = 90.0
+ENTRY_RECONNECT_RESULT_TIMEOUT = 180.0
+ENTRY_RECONNECT_BACKOFF = (15.0, 30.0, 60.0)
+ENTRY_RECONNECT_MAX_ATTEMPTS = len(ENTRY_RECONNECT_BACKOFF)
 
 NO_MATCH_RESTART_ENABLED  = False
 NO_MATCH_RESTART_TIMEOUT  = 90.0
@@ -264,6 +268,8 @@ class BotState:
         self.auth_to_game_id: Dict[str, str] = {}
         self.game_to_auth_id: Dict[str, str] = {}
         self.account_token_map: Dict[str, str] = {}
+        self.active_match_tasks: Dict[str, set] = {}
+        self.entry_reconnect_runtime: Dict[str, dict] = {}
         self.paused: set = set()
         self.writers: Dict[str, list] = {}
         self.logs: List[dict] = []
@@ -304,7 +310,27 @@ class BotState:
             "uptime_seconds": existing.get("uptime_seconds", 0),
             "last_match_time": existing.get("last_match_time", "Running..."),
             "is_paused": False,
+            "reconnect_attempts": existing.get("reconnect_attempts", 0),
+            "reconnect_successes": existing.get("reconnect_successes", 0),
+            "reconnect_failures": existing.get("reconnect_failures", 0),
+            "reconnect_state": existing.get("reconnect_state", "idle"),
         }
+
+    def track_match_task(self, uid, task):
+        uid = str(uid)
+        tasks = self.active_match_tasks.setdefault(uid, set())
+        tasks.add(task)
+        def _remove_done(done_task):
+            current = self.active_match_tasks.get(uid)
+            if current is not None:
+                current.discard(done_task)
+                if not current:
+                    self.active_match_tasks.pop(uid, None)
+        task.add_done_callback(_remove_done)
+
+    def has_active_match_task(self, uid):
+        tasks = self.active_match_tasks.get(str(uid), set())
+        return any(not task.done() for task in tasks)
 
     def update_status(self, uid, status, matches=0):
         uid = str(uid)
@@ -523,19 +549,133 @@ def _any_bot_in_match() -> bool:
     return False
 
 async def _match_entry_watchdog():
-    print_info(f"[MATCH-STATUS] entry verification timeout={MATCH_ENTRY_CONFIRM_TIMEOUT:.0f}s")
+    print_info(f"[MATCH-STATUS] entry verification timeout={MATCH_ENTRY_CONFIRM_TIMEOUT:.0f}s; reconnect grace={ENTRY_RECONNECT_GRACE:.0f}s; max retries={ENTRY_RECONNECT_MAX_ATTEMPTS}")
     while True:
         await asyncio.sleep(5.0)
         now = time.time()
         for uid, account in list(bot_state.accounts.items()):
+            uid = str(uid)
+            episode = bot_state.entry_reconnect_runtime.setdefault(uid, {
+                "attempts": 0, "next_at": 0.0, "pending": False, "deadline": 0.0,
+            })
             status = str(account.get("status", "")).upper()
+            auth_uid = str(account.get("auth_uid") or bot_state.game_to_auth_id.get(uid) or uid)
+            if episode.get("pending"):
+                async with _team_state["lock"]:
+                    peer = _team_state["peers"].get(uid) or _team_state["peers"].get(auth_uid)
+                    writer = peer.get("writer") if isinstance(peer, dict) else None
+                    connected = bool(writer and not writer.is_closing())
+                if connected:
+                    episode.update({"attempts": 0, "next_at": 0.0, "pending": False, "deadline": 0.0})
+                    account["reconnect_successes"] = int(account.get("reconnect_successes", 0)) + 1
+                    account["reconnect_state"] = "connected"
+                    bot_state.log(f"[AUTO-RECONNECT] uid={uid} gateway connected; recovery succeeded", "success")
+                elif now >= float(episode.get("deadline", 0.0)):
+                    episode["pending"] = False
+                    episode["next_at"] = now + ENTRY_RECONNECT_BACKOFF[min(max(episode["attempts"] - 1, 0), len(ENTRY_RECONNECT_BACKOFF) - 1)]
+                    account["reconnect_failures"] = int(account.get("reconnect_failures", 0)) + 1
+                    account["reconnect_state"] = "retry_wait" if episode["attempts"] < ENTRY_RECONNECT_MAX_ATTEMPTS else "failed"
+                    bot_state.log(f"[AUTO-RECONNECT] uid={uid} attempt={episode['attempts']} timed out waiting for gateway", "warning")
             attempt_id = account.get("match_attempt_id")
             started_at = account.get("match_connection_started_at")
-            if not attempt_id or status not in {"CONNECTING", "SERVER_RESPONDING"} or not started_at:
+            if attempt_id and status in {"CONNECTING", "SERVER_RESPONDING"} and started_at:
+                elapsed = now - float(started_at)
+                if elapsed >= MATCH_ENTRY_CONFIRM_TIMEOUT:
+                    bot_state.mark_match_entry_unconfirmed(uid, attempt_id, elapsed)
+                    status = "ENTRY_UNCONFIRMED"
+            if status != "ENTRY_UNCONFIRMED" or bot_state.is_paused(uid):
                 continue
-            elapsed = now - float(started_at)
-            if elapsed >= MATCH_ENTRY_CONFIRM_TIMEOUT:
-                bot_state.mark_match_entry_unconfirmed(uid, attempt_id, elapsed)
+            if now - float(account.get("status_updated_at", now)) < ENTRY_RECONNECT_GRACE:
+                continue
+            if episode.get("pending") or now < float(episode.get("next_at", 0.0)):
+                continue
+            if episode["attempts"] >= ENTRY_RECONNECT_MAX_ATTEMPTS:
+                account["reconnect_state"] = "failed"
+                continue
+            if status == "IN_MATCH_CONFIRMED" or bot_state.has_active_match_task(uid):
+                continue
+            game_uid = str(bot_state.auth_to_game_id.get(auth_uid) or uid)
+            if bot_state.has_active_match_task(game_uid):
+                continue
+            async with _team_state["lock"]:
+                peers = _team_state["peers"]
+                live_peer = peers.get(uid) or peers.get(auth_uid) or peers.get(game_uid)
+                live_writer = live_peer.get("writer") if isinstance(live_peer, dict) else None
+                if live_writer and not live_writer.is_closing():
+                    continue
+            credential = _entry_reconnect_credentials(uid, auth_uid, account)
+            if not credential:
+                account["reconnect_state"] = "unavailable"
+                bot_state.log(f"[AUTO-RECONNECT] uid={uid} skipped; no saved guest credentials or token", "warning")
+                episode["attempts"] = ENTRY_RECONNECT_MAX_ATTEMPTS
+                continue
+            workers = {bot_state.account_workers.get(key) for key in {uid, auth_uid, game_uid} if bot_state.account_workers.get(key)}
+            workers = {task for task in workers if not task.done() and task is not asyncio.current_task()}
+            if len(workers) > 1:
+                bot_state.log(f"[AUTO-RECONNECT] uid={uid} skipped; multiple workers are active", "warning")
+                continue
+            try:
+                for old_task in workers:
+                    old_task.cancel()
+                if workers:
+                    await asyncio.wait_for(asyncio.gather(*workers, return_exceptions=True), timeout=5.0)
+                kind = credential[0]
+                if kind == "guest":
+                    _, guest_uid, password, region, clan_id = credential
+                    new_task = asyncio.create_task(account_loop_guest(
+                        guest_uid, password, region_override=region, clan_override=None))
+                    bot_state.account_workers[guest_uid] = new_task
+                    bot_state.account_workers[uid] = new_task
+                    if game_uid != uid: bot_state.account_workers[game_uid] = new_task
+                else:
+                    _, token = credential
+                    new_task = asyncio.create_task(account_loop_token(token))
+                    bot_state.account_workers[uid] = new_task
+                    bot_state.account_workers[game_uid] = new_task
+                    bot_state.account_workers[f"tok_{token[:16]}"] = new_task
+                episode["attempts"] += 1
+                episode["pending"] = True
+                episode["deadline"] = now + ENTRY_RECONNECT_RESULT_TIMEOUT
+                account["reconnect_attempts"] = int(account.get("reconnect_attempts", 0)) + 1
+                account["reconnect_state"] = "attempting"
+                bot_state.log(f"[AUTO-RECONNECT] uid={uid} attempt={episode['attempts']}/{ENTRY_RECONNECT_MAX_ATTEMPTS} started; no active match task or gateway peer", "warning")
+            except asyncio.TimeoutError:
+                episode["attempts"] += 1
+                episode["next_at"] = now + ENTRY_RECONNECT_BACKOFF[min(episode["attempts"] - 1, len(ENTRY_RECONNECT_BACKOFF) - 1)]
+                account["reconnect_failures"] = int(account.get("reconnect_failures", 0)) + 1
+                account["reconnect_attempts"] = int(account.get("reconnect_attempts", 0)) + 1
+                account["reconnect_state"] = "retry_wait" if episode["attempts"] < ENTRY_RECONNECT_MAX_ATTEMPTS else "failed"
+                bot_state.log(f"[AUTO-RECONNECT] uid={uid} abort; old worker did not stop within 5s", "error")
+            except Exception as e:
+                episode["attempts"] += 1
+                episode["next_at"] = now + ENTRY_RECONNECT_BACKOFF[min(episode["attempts"] - 1, len(ENTRY_RECONNECT_BACKOFF) - 1)]
+                account["reconnect_failures"] = int(account.get("reconnect_failures", 0)) + 1
+                account["reconnect_attempts"] = int(account.get("reconnect_attempts", 0)) + 1
+                account["reconnect_state"] = "retry_wait" if episode["attempts"] < ENTRY_RECONNECT_MAX_ATTEMPTS else "failed"
+                bot_state.log(f"[AUTO-RECONNECT] uid={uid} failed to start: {type(e).__name__}", "error")
+
+def _entry_reconnect_credentials(uid, auth_uid, account):
+    runtime = bot_state.account_credentials.get(str(uid)) or bot_state.account_credentials.get(str(auth_uid)) or {}
+    if runtime.get("auth_type") == "token" and runtime.get("auth_token"):
+        return ("token", str(runtime["auth_token"]))
+    runtime_guest = None
+    if runtime.get("auth_type") == "guest" and runtime.get("auth_password"):
+        runtime_guest = ("guest", str(runtime.get("auth_uid") or auth_uid),
+                         str(runtime["auth_password"]), runtime.get("region") or account.get("region"), None)
+    try:
+        records = state_store.load_json("accounts", ACCOUNTS_FILE, []) or []
+        for record in records if isinstance(records, list) else []:
+            if not isinstance(record, dict): continue
+            saved_uid = str(record.get("uid", "")).strip()
+            if saved_uid not in {str(uid), str(auth_uid)}: continue
+            if record.get("token"):
+                return ("token", str(record["token"]))
+            if record.get("password"):
+                return ("guest", saved_uid, str(record["password"]),
+                        record.get("region") or account.get("region"), record.get("clan_id"))
+    except Exception as e:
+        bot_state.log(f"[AUTO-RECONNECT] uid={uid} credential lookup failed: {type(e).__name__}", "error")
+    return runtime_guest
 
 async def _no_match_watchdog():
     if not NO_MATCH_RESTART_ENABLED: return
@@ -2717,6 +2857,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                               match_index=match_index, attempt_id=attempt_id,
                                               status_uid=uid_str))
                                 play_matches.append(new_match)
+                                bot_state.track_match_task(uid_str, new_match)
 
                                 async def drain_gw():
                                     while not new_match.done():
@@ -3517,7 +3658,11 @@ async def api_teams(request):
                 uid = str(member.get("uid", ""))
                 runtime = _runtime_account_for_auth_uid(uid)
                 safe = {"uid": uid, "status": runtime.get("status", "OFFLINE"),
-                        "clan_status": member.get("clan_status", "unknown")}
+                        "clan_status": member.get("clan_status", "unknown"),
+                        "reconnect_attempts": runtime.get("reconnect_attempts", 0),
+                        "reconnect_successes": runtime.get("reconnect_successes", 0),
+                        "reconnect_failures": runtime.get("reconnect_failures", 0),
+                        "reconnect_state": runtime.get("reconnect_state", "idle")}
                 nickname = runtime.get("nickname") or member.get("nickname")
                 if nickname is not None: safe["nickname"] = nickname
                 members.append(safe)
@@ -3536,7 +3681,11 @@ async def api_teams(request):
             members = []
             for record in records_for_group:
                 uid = str(record.get("uid", "")); runtime = _runtime_account_for_auth_uid(uid)
-                item = {"uid": uid, "status": runtime.get("status", "OFFLINE"), "clan_status": "unknown"}
+                item = {"uid": uid, "status": runtime.get("status", "OFFLINE"), "clan_status": "unknown",
+                        "reconnect_attempts": runtime.get("reconnect_attempts", 0),
+                        "reconnect_successes": runtime.get("reconnect_successes", 0),
+                        "reconnect_failures": runtime.get("reconnect_failures", 0),
+                        "reconnect_state": runtime.get("reconnect_state", "idle")}
                 nickname = runtime.get("nickname")
                 if nickname is not None: item["nickname"] = nickname
                 members.append(item)
