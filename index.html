@@ -67,6 +67,10 @@ button{cursor:pointer;background:none;border:0}
 .btn.ok{background:linear-gradient(135deg,#34d399,#10b981);border-color:transparent;color:#03150e}
 .btn.danger{background:rgba(248,113,113,.14);border-color:rgba(248,113,113,.4);color:#fecaca}
 .btn.on{background:rgba(139,92,246,.16);border-color:rgba(139,92,246,.4);color:#fff}
+.auth-user{display:inline-flex;align-items:center;gap:7px;max-width:190px;padding:0 10px;height:36px;border:1px solid rgba(52,211,153,.3);border-radius:99px;color:var(--ok);font-size:12px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.auth-user[hidden],#telegramLogoutBtn[hidden],#telegramLoginBtn[hidden]{display:none}
+.telegram-login{border-color:rgba(41,169,224,.45);background:rgba(41,169,224,.12);color:#b8e8ff}
+.telegram-login:hover{background:rgba(41,169,224,.22)}
 .spin{animation:rot 1s linear infinite}@keyframes rot{to{transform:rotate(360deg)}}
 .glow{position:relative;background:var(--s1);border:1px solid var(--line);border-radius:18px;transition:border-color var(--ease),transform var(--ease)}
 .glow:hover{border-color:var(--line2);background-image:radial-gradient(380px circle at var(--mx,50%) var(--my,50%),rgba(139,92,246,.13),transparent 60%)}
@@ -170,7 +174,7 @@ button{cursor:pointer;background:none;border:0}
 .import-actions{margin-top:12px}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .card-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}
-@media(max-width:600px){.modal{align-items:flex-end;padding:0}.sheet{max-width:none;border-radius:22px 22px 0 0;padding-bottom:max(26px,env(safe-area-inset-bottom))}.two{grid-template-columns:1fr}.metrics{grid-template-columns:1fr 1fr}.metric:last-child{grid-column:1/-1}.pill span{display:none}.pill{width:38px;padding:0;justify-content:center}.page-head .row,.page-head .row .btn{width:100%}.page-head .row .btn{flex:1}}
+@media(max-width:600px){.modal{align-items:flex-end;padding:0}.sheet{max-width:none;border-radius:22px 22px 0 0;padding-bottom:max(26px,env(safe-area-inset-bottom))}.two{grid-template-columns:1fr}.metrics{grid-template-columns:1fr 1fr}.metric:last-child{grid-column:1/-1}.pill span{display:none}.pill{width:38px;padding:0;justify-content:center}.auth-user{display:none}.brand-m span{display:none}.telegram-login{width:42px;min-width:42px;padding:0}.telegram-login .auth-label{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}.page-head .row,.page-head .row .btn{width:100%}.page-head .row .btn{flex:1}}
 .toasts{position:fixed;inset-inline:16px;bottom:16px;z-index:400;display:flex;flex-direction:column;align-items:flex-end;gap:8px;pointer-events:none}
 .toast{max-width:min(420px,100%);display:flex;align-items:center;gap:11px;padding:12px 16px;border-radius:13px;font-weight:600;font-size:13px;background:rgba(14,16,40,.97);border:1px solid var(--line2);border-inline-start:4px solid var(--accent1);box-shadow:0 12px 32px rgba(0,0,0,.5);pointer-events:auto;animation:tin .3s var(--ease) both;transition:border-color 1s ease}
 .toast.success{border-inline-start-color:var(--ok)}.toast.error{border-inline-start-color:var(--err)}
@@ -201,6 +205,9 @@ button{cursor:pointer;background:none;border:0}
       <div class="brand-m"><div class="logo"><i class="fa-solid fa-bolt"></i></div><span>RAFIN TxT</span></div>
       <div class="crumb"><span>Command Center</span><i class="fa-solid fa-chevron-right" style="font-size:10px"></i><b id="topTitle">Command Core</b></div>
       <div class="top-right">
+        <span class="auth-user" id="telegramUserBadge" hidden><i class="fa-brands fa-telegram"></i><span id="telegramUserLabel"></span></span>
+        <button class="btn telegram-login" id="telegramLoginBtn" type="button" disabled aria-label="تسجيل الدخول عبر تيليجرام" title="تسجيل الدخول عبر تيليجرام"><i class="fa-brands fa-telegram"></i><span class="auth-label">تسجيل الدخول عبر تيليجرام</span></button>
+        <button class="btn" id="telegramLogoutBtn" type="button" hidden><i class="fa-solid fa-arrow-right-from-bracket"></i><span>تسجيل الخروج</span></button>
         <div class="pill" id="pill"><i class="dot"></i><span id="pillText">ONLINE</span></div>
       </div>
     </header>
@@ -360,8 +367,10 @@ button{cursor:pointer;background:none;border:0}
 <div class="modal" id="authModal" aria-hidden="true">
   <div class="sheet">
     <h2>Admin access</h2>
+    <p class="lead" id="telegramAuthHint">Use a secure Telegram login or the existing admin token.</p>
+    <div class="card-actions" style="margin:12px 0 18px"><button type="button" class="btn telegram-login" id="modalTelegramLogin" disabled aria-label="تسجيل الدخول عبر تيليجرام"><i class="fa-brands fa-telegram"></i><span>تسجيل الدخول عبر تيليجرام</span></button></div>
     <form id="authForm" novalidate>
-      <p class="lead">Enter the admin token configured in the hosting environment. This browser will remember it so you only need to enter it once. Keep this device private.</p>
+      <p class="lead">Or enter the admin token configured in the hosting environment. Keep this device private.</p>
       <div class="field"><label for="adminToken">Admin token</label><input type="password" id="adminToken" autocomplete="current-password" required></div>
       <div class="card-actions"><button type="submit" class="btn primary">Unlock dashboard</button></div>
     </form>
@@ -445,16 +454,89 @@ document.querySelectorAll("[data-page]").forEach(b => b.addEventListener("click"
 /* ---------- init ---------- */
 function init(){
   if(started) return; started = true;
+  handleTelegramAuthResult();
   go(location.hash.slice(1)); fetchStats();
   setInterval(() => { if(!document.hidden) fetchStats(); }, 3000);
 }
-init();
+window.addEventListener("DOMContentLoaded", init, {once:true});
 
 /* ---------- API ---------- */
 let authPromptBlocked = false;
 let adminTokenPromise = null;
 let currentAdminToken = "";
+let telegramSessionPromise = null;
+let telegramSessionData = null;
+let telegramLoginEnabled = false;
+let telegramSessionKnown = false;
+function updateTelegramControls(data){
+  telegramSessionData = data && data.authenticated ? data.user : null;
+  telegramLoginEnabled = !!(data && data.telegram_login_enabled);
+  telegramSessionKnown = true;
+  const login = $("telegramLoginBtn"), logout = $("telegramLogoutBtn"), badge = $("telegramUserBadge");
+  const modalLogin = $("modalTelegramLogin"), hint = $("telegramAuthHint");
+  const authenticated = !!telegramSessionData;
+  if(login){ login.hidden = authenticated; login.disabled = !telegramLoginEnabled; }
+  if(logout) logout.hidden = !authenticated;
+  if(badge){ badge.hidden = !authenticated; $("telegramUserLabel").textContent = telegramSessionData?.username ? "@" + telegramSessionData.username : (telegramSessionData?.name || "Telegram"); }
+  if(modalLogin) modalLogin.disabled = !telegramLoginEnabled;
+  if(hint) hint.textContent = telegramLoginEnabled
+    ? "Sign in with Telegram. The server verifies Telegram's signed ID token before granting access."
+    : "Telegram login is not configured on Render yet. The existing admin token remains available.";
+}
+async function getTelegramSession(force=false){
+  if(force) telegramSessionPromise = null;
+  if(!telegramSessionPromise){
+    telegramSessionPromise = fetch("/api/session", {cache:"no-store", credentials:"same-origin"})
+      .then(async response => response.ok ? await response.json() : {})
+      .catch(() => ({}))
+      .then(data => { updateTelegramControls(data); return data; });
+  }
+  return telegramSessionPromise;
+}
+function beginTelegramLogin(){
+  if(!telegramSessionKnown || !telegramLoginEnabled){
+    toast("تسجيل الدخول عبر تيليجرام غير مُهيأ بعد في Render.", "error");
+    return;
+  }
+  window.location.assign("/auth/telegram/start");
+}
+$("telegramLoginBtn").addEventListener("click", beginTelegramLogin);
+$("modalTelegramLogin").addEventListener("click", beginTelegramLogin);
+$("telegramLogoutBtn").addEventListener("click", async () => {
+  const button = $("telegramLogoutBtn"); button.disabled = true;
+  try{
+    const response = await fetch("/auth/telegram/logout", {method:"POST", credentials:"same-origin", headers:{"Content-Type":"application/json"}});
+    if(!response.ok) throw new Error("Logout failed");
+    currentAdminToken = ""; authPromptBlocked = false;
+    try{ localStorage.removeItem("adminApiToken"); sessionStorage.removeItem("adminApiToken"); }catch(e){}
+    await getTelegramSession(true);
+    toast("تم تسجيل الخروج بنجاح.", "success");
+  }catch(e){ toast("تعذر تسجيل الخروج. أعد المحاولة.", "error"); }
+  finally{ button.disabled = false; }
+});
+function handleTelegramAuthResult(){
+  const url = new URL(window.location.href), result = url.searchParams.get("auth");
+  if(!result) return;
+  const messages = {
+    success:["تم تسجيل الدخول عبر تيليجرام بنجاح.","success"],
+    denied:["حساب Telegram هذا غير مصرح له بدخول لوحة التحكم.","error"],
+    failed:["تعذر التحقق من تسجيل الدخول عبر Telegram. حاول مجددًا.","error"],
+    cancelled:["تم إلغاء تسجيل الدخول عبر Telegram.","info"],
+    not_configured:["تسجيل الدخول عبر Telegram غير مُهيأ بعد. أكمل إعداد متغيرات Render.","error"]
+  };
+  url.searchParams.delete("auth");
+  history.replaceState(null, "", url.pathname + (url.search ? url.search : "") + url.hash);
+  if(result === "success"){
+    currentAdminToken = ""; authPromptBlocked = false; telegramSessionPromise = null;
+    try{ localStorage.removeItem("adminApiToken"); sessionStorage.removeItem("adminApiToken"); }catch(e){}
+    getTelegramSession(true).then(() => fetchStats());
+  }
+  const message = messages[result];
+  if(message) setTimeout(() => toast(message[0], message[1]), 0);
+}
 async function getAdminToken(){
+  const telegramSession = await getTelegramSession();
+  if(telegramSession && telegramSession.authenticated){ currentAdminToken = ""; return ""; }
   let saved = currentAdminToken;
   if(!saved){
     try{ saved = localStorage.getItem("adminApiToken") || sessionStorage.getItem("adminApiToken") || ""; }catch(e){}
@@ -487,15 +569,18 @@ async function getAdminToken(){
   return adminTokenPromise;
 }
 async function apiFetch(url, options={}){
-  const token = url === "/api/ping" ? "" : await getAdminToken();
+  const token = ["/api/ping", "/api/session"].includes(url) ? "" : await getAdminToken();
   const headers = new Headers(options.headers || {});
   if(token) headers.set("Authorization", "Bearer " + token);
-  const response = await fetch(url, {...options, headers});
+  const response = await fetch(url, {...options, headers, credentials:options.credentials || "same-origin"});
   if(response.status === 401){
     currentAdminToken = "";
     try{ localStorage.removeItem("adminApiToken"); sessionStorage.removeItem("adminApiToken"); }catch(e){}
-    authPromptBlocked = true;
-    throw new Error("Admin token rejected. Reload the page and enter the correct token.");
+    authPromptBlocked = false; telegramSessionPromise = null;
+    const refreshed = await getTelegramSession(true);
+    throw new Error(refreshed?.telegram_login_enabled
+      ? "Your sign-in expired. Sign in with Telegram again."
+      : "Admin token rejected. Enter the correct token to continue.");
   }
   return response;
 }

@@ -26,6 +26,7 @@ import itertools, traceback, ssl, hmac, hashlib, string, re, subprocess, math
 import httpx
 import aiohttp
 import aiohttp.web
+from telegram_auth import telegram_auth as telegram_auth_service
 import state_store
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
@@ -3469,19 +3470,29 @@ async def _autoload_accounts():
 # ==================== HTTP SERVER ====================
 @aiohttp.web.middleware
 async def _api_auth(request, handler):
-    # Keep only the uptime endpoint public. All account/state APIs require a secret.
-    if not request.path.startswith("/api/") or request.path == "/api/ping":
+    # Public health/session endpoints; protected APIs accept either a valid
+    # allowlisted Telegram session or the existing administrator bearer token.
+    if (not request.path.startswith("/api/")
+            or request.path in {"/api/ping", "/api/session"}):
+        return await handler(request)
+    telegram_session = telegram_auth_service.get_session(request)
+    if telegram_session:
+        if not telegram_auth_service.cookie_write_allowed(request):
+            return aiohttp.web.json_response(
+                {"error": "Invalid request origin"}, status=403)
+        request["telegram_user"] = telegram_session
         return await handler(request)
     expected = os.environ.get("ADMIN_API_TOKEN", "").strip()
-    if len(expected) < 32:
-        return aiohttp.web.json_response(
-            {"error": "ADMIN_API_TOKEN is not configured (minimum 32 characters)."},
-            status=503)
     authorization = request.headers.get("Authorization", "")
     supplied = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
-    if not hmac.compare_digest(supplied, expected):
+    if len(expected) >= 32 and supplied and hmac.compare_digest(supplied, expected):
+        return await handler(request)
+    if len(expected) < 32:
+        return aiohttp.web.json_response(
+            {"error": "Sign in with Telegram or configure ADMIN_API_TOKEN (minimum 32 characters)."},
+            status=503)
+    else:
         return aiohttp.web.json_response({"error": "Unauthorized"}, status=401)
-    return await handler(request)
 
 
 @aiohttp.web.middleware
@@ -4166,6 +4177,10 @@ async def start_web_server():
     app.router.add_get("/", serve_index)
     app.router.add_get("/index.html", serve_index)
     app.router.add_get("/api/ping", api_ping)
+    app.router.add_get("/api/session", telegram_auth_service.session_info)
+    app.router.add_get("/auth/telegram/start", telegram_auth_service.start)
+    app.router.add_get("/auth/telegram/callback", telegram_auth_service.callback)
+    app.router.add_post("/auth/telegram/logout", telegram_auth_service.logout)
     app.router.add_get("/api/stats", api_stats)
     app.router.add_get("/api/state", api_state)
     app.router.add_get("/api/teams", api_teams)
@@ -4183,7 +4198,9 @@ async def start_web_server():
     app.router.add_post("/api/account/pause_all", api_account_pause_all)
     app.router.add_post("/api/logs/clear", api_logs_clear)
     app.router.add_get("/api/progress", api_progress)
-    runner = aiohttp.web.AppRunner(app)
+    # The OIDC callback carries a short-lived authorization code in its query.
+    # Keep the custom path-only logger, but do not let aiohttp log query strings.
+    runner = aiohttp.web.AppRunner(app, access_log=None)
     await runner.setup()
     site = aiohttp.web.TCPSite(runner, WEB_HOST, WEB_PORT)
     await site.start()

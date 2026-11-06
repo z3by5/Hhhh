@@ -6,3 +6,4 @@ protobuf
 requests
 aiohttp
 mysql-connector-python>=9.0,<10
+PyJWT[crypto]>=2.10,<3
