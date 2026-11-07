@@ -16,15 +16,15 @@
 #  ┌──────────────────────────────────────────────────────────────────┐
 #  │  Project      :  thunderFF                                       │
 #  │  Module       :  thunderFF_pb2                                   │
-#  │  Author       :  RAFIN TxT                                       │
+#  │  Author       :  AlZ3By                                       │
 #  │  Protobuf Ver :  7.35.1                                          │
 #  │  Language     :  Python                                          │
 #  │  Status       :  Auto-generated — DO NOT EDIT                    │
 #  └──────────────────────────────────────────────────────────────────┘
 #
-#  © RAFIN TxT — All rights reserved.
+#  © AlZ3By — All rights reserved.
 #
-"""RAFIN TxT — thunderFF Protocol Buffer Module.
+"""AlZ3By — thunderFF Protocol Buffer Module.
 
 Premium Edition — auto-generated protocol buffer code.
 Source: thunderFF.proto
@@ -78,5 +78,5 @@ if not _descriptor._USE_C_DESCRIPTORS:
 # @@protoc_insertion_point(module_scope)
 
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║   End of file  —  RAFIN TxT  —  Premium Edition                      ║
+# ║   End of file  —  AlZ3By  —  Premium Edition                      ║
 # ╚══════════════════════════════════════════════════════════════════════╝

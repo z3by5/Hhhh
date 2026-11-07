@@ -16,15 +16,15 @@
 #  ┌──────────────────────────────────────────────────────────────────┐
 #  │  Project      :  reqClan                                         │
 #  │  Module       :  reqClan_pb2                                     │
-#  │  Author       :  RAFIN TxT                                       │
+#  │  Author       :  AlZ3By                                       │
 #  │  Protobuf Ver :  6.30.0                                          │
 #  │  Language     :  Python                                          │
 #  │  Status       :  Auto-generated — DO NOT EDIT                    │
 #  └──────────────────────────────────────────────────────────────────┘
 #
-#  © RAFIN TxT — All rights reserved.
+#  © AlZ3By — All rights reserved.
 #
-"""RAFIN TxT — reqClan Protocol Buffer Module.
+"""AlZ3By — reqClan Protocol Buffer Module.
 
 Premium Edition — auto-generated protocol buffer code.
 Source: reqClan.proto
@@ -61,5 +61,5 @@ if not _descriptor._USE_C_DESCRIPTORS:
 # @@protoc_insertion_point(module_scope)
 
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║   End of file  —  RAFIN TxT  —  Premium Edition                      ║
+# ║   End of file  —  AlZ3By  —  Premium Edition                      ║
 # ╚══════════════════════════════════════════════════════════════════════╝

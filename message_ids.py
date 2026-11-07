@@ -16,15 +16,15 @@
 #  ┌──────────────────────────────────────────────────────────────────┐
 #  │  Project      :  Free Fire Protocol                              │
 #  │  Module       :  Message ID → Name Mapping                       │
-#  │  Author       :  RAFIN TxT                                       │
+#  │  Author       :  AlZ3By                                       │
 #  │  Scope        :  RUDP + UDP                                       │
 #  │  Language     :  Python                                          │
 #  └──────────────────────────────────────────────────────────────────┘
 #
-#  © RAFIN TxT — All rights reserved.
+#  © AlZ3By — All rights reserved.
 #
 """
-RAFIN TxT — Free Fire Message ID → Name mapping.
+AlZ3By — Free Fire Message ID → Name mapping.
 
 Premium Edition — Game protocol message IDs (RUDP + UDP).
 """
@@ -1916,5 +1916,5 @@ MESSAGE_ID_TO_NAME = {
 }
 
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║   End of file  —  RAFIN TxT  —  Premium Edition                      ║
+# ║   End of file  —  AlZ3By  —  Premium Edition                      ║
 # ╚══════════════════════════════════════════════════════════════════════╝

@@ -16,15 +16,15 @@
 #  ┌──────────────────────────────────────────────────────────────────┐
 #  │  Project      :  FreeFire Level Up Bot                           │
 #  │  Module       :  Web Dashboard & Real-Time EXP Tracker           │
-#  │  Author       :  RAFIN TxT                                       │
+#  │  Author       :  AlZ3By                                       │
 #  │  Server       :  aiohttp Embedded Async Web Server                │
 #  │  Language     :  Python                                          │
 #  └──────────────────────────────────────────────────────────────────┘
 #
-#  © RAFIN TxT — All rights reserved.
+#  © AlZ3By — All rights reserved.
 #
 """
-RAFIN TxT — FreeFire Level Up Bot
+AlZ3By — FreeFire Level Up Bot
 Professional Web Dashboard & Real-Time EXP Tracker.
 
 Embedded Async Web Server (aiohttp)
@@ -405,9 +405,9 @@ bot_state = BotState()
 # Fallback HTML if templates/index.html is missing
 FALLBACK_INDEX_HTML = """<!DOCTYPE html>
 <html>
-<head><title>RAFIN TxT — Command Center</title></head>
+<head><title>AlZ3By — Command Center</title></head>
 <body style="background:#0a0a12;color:#fff;font-family:sans-serif;text-align:center;padding:50px;">
-<h1>RAFIN TxT</h1>
+<h1>AlZ3By</h1>
 <p>BOT RUNNING — templates/index.html is loading...</p>
 </body>
 </html>"""
@@ -440,7 +440,7 @@ async def handle_get_stats(request: web.Request) -> web.Response:
         acc["is_paused"] = bot_state.is_paused(uid_k)
 
     return web.json_response({
-        "brand": "RAFIN TxT",
+        "brand": "AlZ3By",
         "total_accounts": len(bot_state.accounts),
         "total_matches": bot_state.total_matches,
         "total_matches_started": bot_state.total_matches_started,
@@ -793,9 +793,9 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
     await runner.setup()
     site = web.TCPSite(runner, host, port)
     await site.start()
-    print(f"[WEB] RAFIN TxT Dashboard running on http://{host}:{port}")
+    print(f"[WEB] AlZ3By Dashboard running on http://{host}:{port}")
     return runner
 
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║   End of file  —  RAFIN TxT  —  Premium Edition                      ║
+# ║   End of file  —  AlZ3By  —  Premium Edition                      ║
 # ╚══════════════════════════════════════════════════════════════════════╝

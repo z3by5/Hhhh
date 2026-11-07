@@ -15,11 +15,11 @@
 #  ╭──────────────────────────────────────────────────────────────────╮
 #  │  ◆ PROJECT   ›  FREE FIRE 4-BOT SQUAD + AUTO CREATE + MOVEMENT   │
 #  │  ◆ MODULE    ›  Main.py                                          │
-#  │  ◆ AUTHOR    ›  RAFIN TxT                                        │
+#  │  ◆ AUTHOR    ›  AlZ3By                                        │
 #  │  ◆ ENGINE    ›  Python 3.10+                                     │
 #  ╰──────────────────────────────────────────────────────────────────╯
 #
-#  © 2026 RAFIN TxT — All rights reserved.
+#  © 2026 AlZ3By — All rights reserved.
 # ════════════════════════════════════════════════════════════════════════
 import sys, os, json, time, uuid, random, asyncio, base64, struct, socket
 import itertools, traceback, ssl, hmac, hashlib, string, re, subprocess, math
@@ -27,6 +27,7 @@ import httpx
 import aiohttp
 import aiohttp.web
 from telegram_auth import telegram_auth as telegram_auth_service
+from telegram_bot import TelegramBot
 import state_store
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
@@ -64,7 +65,7 @@ TEAMS_FILE = "teams.json"
 TOKEN_CACHE_FILE = "token_cache.json"
 DEVICES_FILE = "devices.json"
 TOKEN_CACHE_TTL = 1200
-INDEX_HTML_PATH = "rafin_txt_565/index.html"
+INDEX_HTML_PATH = "alz3by_565/index.html"
 
 START_MATCH_INTERVAL = 3.0
 NEW_MATCH_DELAY = 2.0
@@ -157,7 +158,7 @@ REGION_LANG = {"ME":"ar","IND":"hi","ID":"id","VN":"vi","TH":"th","BD":"bn",
                "SG":"pt","US":"pt"}
 
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║   ✦  PREMIUM CONSOLE DESIGN LAYER  ✦  (RAFIN TxT Edition)           ║
+# ║   ✦  PREMIUM CONSOLE DESIGN LAYER  ✦  (AlZ3By Edition)           ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 
 class PX:
@@ -257,7 +258,7 @@ def print_banner():
     print(f"{violet}    ║{R}   {silver}▸ Auto Create · Anti-AFK · Multi-Region · Team{R}          {violet}║{R}")
     print(f"{violet}    ║{R}   {teal}▸ Engine v2.0  ·  Python 3.10+{R}                         {violet}║{R}")
     print(f"{violet}    ╚══════════════════════════════════════════════════════════╝{R}")
-    print(f"{PX.SLATE}              © 2026 RAFIN TxT — All rights reserved.{R}")
+    print(f"{PX.SLATE}              © 2026 AlZ3By — All rights reserved.{R}")
     print()
 
 # ==================== STATE ====================
@@ -3255,7 +3256,7 @@ async def major_register(release_v, access_token, open_id, name, game_version,
     except Exception as e:
         print_error(f"MAJOR-REG {e}"); return None
 
-async def create_four_accounts(region: str, clan_id: str, count: int = 4, password: str = "RAFIN", team_id: Optional[str] = None):
+async def create_four_accounts(region: str, clan_id: str, count: int = 4, password: str = "AlZ3By", team_id: Optional[str] = None):
     bot_state.creating = True
     bot_state.create_progress = []
     def _prog(s):
@@ -3288,7 +3289,7 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
                 platform = tok.get("platform", 4)
                 major_payload, login_payload = await get_payload(
                     access_token, open_id, platform, game_version, lang)
-                nickname_final = "RAFIN•" + "".join(
+                nickname_final = "AlZ3By•" + "".join(
                     random.choices(string.ascii_uppercase + string.digits, k=5))
                 mr = await major_register(release_v, access_token, open_id,
                                           nickname_final, game_version, login_url, lang)
@@ -3521,10 +3522,10 @@ async def serve_index(request):
             with open(path, "r", encoding="utf-8") as f:
                 return aiohttp.web.Response(text=f.read(), content_type="text/html")
         except Exception: continue
-    return aiohttp.web.Response(text="<h1>RAFIN TxT</h1>", content_type="text/html")
+    return aiohttp.web.Response(text="<h1>AlZ3By</h1>", content_type="text/html")
 
 async def api_ping(request):
-    return aiohttp.web.json_response({"pong": True, "app": "RAFIN TxT", "version": "2.0"})
+    return aiohttp.web.json_response({"pong": True, "app": "AlZ3By", "version": "2.0"})
 
 _PRIVATE_ACCOUNT_FIELDS = {
     "token", "access_token", "auth_token", "auth_password", "password",
@@ -3539,7 +3540,11 @@ def _public_account_view(account):
 
 async def api_stats(request):
     try:
-        accs = [_public_account_view(a) for a in bot_state.accounts.values()]
+        accs = []
+        for account in bot_state.accounts.values():
+            public = _public_account_view(account)
+            public["is_paused"] = bot_state.is_paused(str(account.get("uid", "")))
+            accs.append(public)
         online_statuses = {"ONLINE", "SEARCHING", "CONNECTING", "SERVER_RESPONDING", "ENTRY_UNCONFIRMED", "IN_MATCH_CONFIRMED"}
         online = sum(1 for a in accs if str(a.get("status", "")).upper() in online_statuses)
         active_matches = sum(a.get("active_matches", 0) for a in accs)
@@ -3612,7 +3617,7 @@ async def api_create_team(request):
         region = str(body.get("region", "ID")).upper()
         clan_id = str(body.get("clan_id", "")).strip()
         count = int(body.get("count", 4))
-        password = str(body.get("password", "RAFIN")).strip() or "RAFIN"
+        password = str(body.get("password", "AlZ3By")).strip() or "AlZ3By"
         if not clan_id:
             return aiohttp.web.json_response({"ok": False, "error": "clan_id required"})
         if bot_state.creating:
@@ -4174,6 +4179,30 @@ async def account_loop_token(token):
 
 async def start_web_server():
     app = aiohttp.web.Application(middlewares=[_api_auth, _req_logger])
+    telegram_bot_service = TelegramBot({
+        "stats": api_stats,
+        "teams": api_teams,
+        "cycle_status": api_match_cycle_status,
+        "create_team": api_create_team,
+        "account_pause": api_account_pause,
+        "account_refresh": api_account_refresh,
+        "account_restart": api_account_restart,
+        "account_delete": api_account_delete,
+        "pause_all": api_account_pause_all,
+        "cycle_start": api_match_cycle_start,
+        "cycle_stop": api_match_cycle_stop,
+        "clear_logs": api_logs_clear,
+    }, state_store)
+    app.router.add_post("/telegram/webhook", telegram_bot_service.webhook)
+
+    async def _telegram_cleanup(_app):
+        task = _app.get("telegram_bot_setup_task")
+        if task and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await telegram_bot_service.close()
+
+    app.on_cleanup.append(_telegram_cleanup)
     app.router.add_get("/", serve_index)
     app.router.add_get("/index.html", serve_index)
     app.router.add_get("/api/ping", api_ping)
@@ -4204,6 +4233,7 @@ async def start_web_server():
     await runner.setup()
     site = aiohttp.web.TCPSite(runner, WEB_HOST, WEB_PORT)
     await site.start()
+    app["telegram_bot_setup_task"] = asyncio.create_task(telegram_bot_service.startup())
     print_premium(f"Web Dashboard → http://localhost:{WEB_PORT}",
                   color=PX.CYAN, icon=I["rocket"], tag="WEB")
     return runner
@@ -4211,6 +4241,7 @@ async def start_web_server():
 # ==================== MAIN ====================
 async def main():
     print_banner()
+    web_runner = None
     try:
         if state_store.database_configured():
             state_store.initialize()
@@ -4219,7 +4250,7 @@ async def main():
             print_warning("[STORAGE] TiDB is not configured; using local JSON files")
         if len(os.environ.get("ADMIN_API_TOKEN", "").strip()) < 32:
             print_warning("[SECURITY] Set ADMIN_API_TOKEN (32+ characters) in the service environment")
-        await start_web_server()
+        web_runner = await start_web_server()
     except Exception as e:
         print_error(f"WEB {e}"); return
     try:
@@ -4228,7 +4259,7 @@ async def main():
         print_error(f"BOOT autoload failed: {e}")
     asyncio.create_task(_no_match_watchdog())
     asyncio.create_task(_match_entry_watchdog())
-    print_rule("RAFIN TxT · Premium · All Systems Online", color=PX.EMERALD)
+    print_rule("AlZ3By · Premium · All Systems Online", color=PX.EMERALD)
     try:
         while True:
             await asyncio.sleep(1)
@@ -4237,6 +4268,10 @@ async def main():
         for t in list(bot_state.account_workers.values()):
             t.cancel()
         await asyncio.gather(*bot_state.account_workers.values(), return_exceptions=True)
+    finally:
+        if web_runner is not None:
+            try: await web_runner.cleanup()
+            except Exception: pass
         try: await client.aclose()
         except Exception: pass
 
@@ -4247,5 +4282,5 @@ if __name__ == "__main__":
         print_warning("stopped")
 
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║   End of file  —  RAFIN TxT  —  Premium Edition                      ║
+# ║   End of file  —  AlZ3By  —  Premium Edition                      ║
 # ╚══════════════════════════════════════════════════════════════════════╝

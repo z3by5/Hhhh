@@ -131,7 +131,9 @@ class TelegramAuthTests(unittest.IsolatedAsyncioTestCase):
         payload = {"id": "987654321", "username": "test_user", "name": "Test User",
                    "iat": int(time.time()), "exp": int(time.time()) + 60}
         signed = self.auth._sign_payload(payload, settings["session_secret"], "session")
-        tampered = signed[:-1] + ("A" if signed[-1] != "A" else "B")
+        encoded, signature = signed.split(".", 1)
+        tampered_signature = ("A" if signature[0] != "A" else "B") + signature[1:]
+        tampered = encoded + "." + tampered_signature
         request = make_mocked_request("GET", "/api/session", headers={"Cookie": f"{SESSION_COOKIE}={tampered}"})
         self.assertIsNone(self.auth.get_session(request))
         expired_payload = dict(payload, exp=int(time.time()) - 1)

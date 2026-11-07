@@ -16,6 +16,10 @@ from typing import Any, Callable
 
 _LOCK = threading.RLock()
 _TABLE = "rafin_app_state"
+_TELEGRAM_EVENTS_TABLE = "alz3by_telegram_update_receipts"
+_TELEGRAM_EVENTS_READY = False
+_LOCAL_TELEGRAM_UPDATES: set[int] = set()
+_LOCAL_TELEGRAM_UPDATE_ORDER: list[int] = []
 _CA_DEFAULT = "/etc/ssl/certs/ca-certificates.crt"
 
 
@@ -92,6 +96,49 @@ def initialize() -> bool:
         finally:
             conn.close()
     return True
+
+
+def claim_telegram_update(update_id: int) -> bool:
+    """Atomically claim a Telegram update ID so webhook retries are harmless."""
+    global _TELEGRAM_EVENTS_READY
+    try:
+        update_id = int(update_id)
+    except (TypeError, ValueError) as exc:
+        raise StoreError("Telegram update ID is invalid.") from exc
+    if update_id < 0:
+        raise StoreError("Telegram update ID is invalid.")
+    with _LOCK:
+        if not database_configured():
+            if update_id in _LOCAL_TELEGRAM_UPDATES:
+                return False
+            _LOCAL_TELEGRAM_UPDATES.add(update_id)
+            _LOCAL_TELEGRAM_UPDATE_ORDER.append(update_id)
+            if len(_LOCAL_TELEGRAM_UPDATES) > 10000:
+                oldest = _LOCAL_TELEGRAM_UPDATE_ORDER.pop(0)
+                _LOCAL_TELEGRAM_UPDATES.discard(oldest)
+            return True
+        conn = _connect()
+        try:
+            cur = conn.cursor()
+            if not _TELEGRAM_EVENTS_READY:
+                cur.execute(
+                    f"CREATE TABLE IF NOT EXISTS {_TELEGRAM_EVENTS_TABLE} ("
+                    "update_id BIGINT NOT NULL PRIMARY KEY, "
+                    "received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+                )
+                _TELEGRAM_EVENTS_READY = True
+            cur.execute(
+                f"INSERT IGNORE INTO {_TELEGRAM_EVENTS_TABLE} (update_id) VALUES (%s)",
+                (update_id,),
+            )
+            claimed = cur.rowcount == 1
+            cur.close()
+            return claimed
+        except Exception as exc:
+            raise StoreError(f"Could not record Telegram update ({type(exc).__name__}).") from exc
+        finally:
+            conn.close()
+
 
 
 def _read_file(path: str | os.PathLike[str], default: Any, decoder: Callable[[Any], Any] | None) -> Any:
