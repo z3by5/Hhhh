@@ -19,6 +19,8 @@ from aiohttp import web
 
 _LOG = logging.getLogger("telegram_bot")
 _SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
+_INTERACTIVE_TIMEOUT = httpx.Timeout(4.0, connect=2.0, read=3.0, write=3.0, pool=1.0)
+_SETUP_TIMEOUT = httpx.Timeout(12.0, connect=5.0)
 _REGION_NAMES = {
     "BD": "Bangladesh", "IND": "India", "ID": "Indonesia", "ME": "Middle East",
     "PK": "Pakistan", "VN": "Vietnam", "TH": "Thailand", "TW": "Taiwan",
@@ -76,14 +78,14 @@ class TelegramBot:
             if not self.allowed_ids: missing.append("TELEGRAM_ALLOWED_USER_IDS")
             _LOG.info("Telegram bot disabled or incomplete; missing/invalid settings: %s", ",".join(missing))
             return
-        self.client = httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0))
+        self.client = httpx.AsyncClient(timeout=_INTERACTIVE_TIMEOUT)
         try:
             result = await self._telegram("setWebhook", {
                 "url": self.webhook_url,
                 "secret_token": self.secret,
                 "allowed_updates": ["message", "callback_query"],
                 "drop_pending_updates": False,
-            })
+            }, timeout=_SETUP_TIMEOUT)
             if result.get("ok"):
                 await self._telegram("setMyCommands", {"commands": [
                     {"command": "start", "description": "فتح القائمة الرئيسية"},
@@ -94,7 +96,7 @@ class TelegramBot:
                     {"command": "matches", "description": "حالة دورة المباريات"},
                     {"command": "logs", "description": "آخر سجلات الخدمة"},
                     {"command": "cancel", "description": "إلغاء العملية الحالية"},
-                ]})
+                ]}, timeout=_SETUP_TIMEOUT)
                 self._started = True
                 _LOG.info("Telegram webhook configured successfully")
             else:
@@ -107,11 +109,16 @@ class TelegramBot:
             await self.client.aclose()
             self.client = None
 
-    async def _telegram(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _telegram(
+        self, method: str, payload: dict[str, Any], *, timeout: httpx.Timeout | None = None,
+    ) -> dict[str, Any]:
         if not self.client or not self.token:
             return {"ok": False, "description": "bot_not_configured"}
+        request_args: dict[str, Any] = {"json": payload}
+        if timeout is not None:
+            request_args["timeout"] = timeout
         response = await self.client.post(
-            f"https://api.telegram.org/bot{self.token}/{method}", json=payload
+            f"https://api.telegram.org/bot{self.token}/{method}", **request_args,
         )
         try:
             data = response.json()
@@ -521,10 +528,12 @@ class TelegramBot:
     async def _send(self, chat_id: str, text: str, keyboard: dict[str, Any] | None = None) -> None:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text[:3900], "disable_web_page_preview": True}
         if keyboard: payload["reply_markup"] = keyboard
+        started = time.monotonic()
         try:
             await self._telegram("sendMessage", payload)
         except Exception as exc:
-            _LOG.error("Telegram sendMessage failed (%s)", type(exc).__name__)
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            _LOG.error("Telegram sendMessage failed (%s, elapsed_ms=%s)", type(exc).__name__, elapsed_ms)
 
     async def _answer_callback(self, callback_id: Any, text: str = "", alert: bool = False) -> None:
         if not callback_id: return
@@ -532,6 +541,8 @@ class TelegramBot:
             payload: dict[str, Any] = {"callback_query_id": str(callback_id)}
             if text: payload["text"] = text[:180]
             if alert: payload["show_alert"] = True
+            started = time.monotonic()
             await self._telegram("answerCallbackQuery", payload)
         except Exception as exc:
-            _LOG.warning("Telegram callback acknowledgement failed (%s)", type(exc).__name__)
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            _LOG.warning("Telegram callback acknowledgement failed (%s, elapsed_ms=%s)", type(exc).__name__, elapsed_ms)

@@ -88,6 +88,8 @@ class TelegramBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_call.args[0], "setWebhook")
         self.assertEqual(first_call.args[1]["url"], "https://example.invalid/telegram/webhook")
         self.assertEqual(first_call.args[1]["secret_token"], "local-test-secret_123")
+        self.assertEqual(self.bot.client.timeout.connect, 2.0)
+        self.assertEqual(first_call.kwargs["timeout"].connect, 5.0)
         self.assertTrue(self.bot._started)
         await self.bot.close()
 
