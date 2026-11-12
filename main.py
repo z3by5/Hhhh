@@ -3656,8 +3656,8 @@ async def api_create_accounts(request):
         count = body.get("count")
         if region not in REGION_LANG:
             return aiohttp.web.json_response({"ok": False, "error": "Invalid region"}, status=400)
-        if type(count) is not int or not 1 <= count <= 10:
-            return aiohttp.web.json_response({"ok": False, "error": "Quantity must be from 1 to 10"}, status=400)
+        if type(count) is not int or not 1 <= count <= 100:
+            return aiohttp.web.json_response({"ok": False, "error": "Quantity must be from 1 to 100"}, status=400)
         if bot_state.creating:
             return aiohttp.web.json_response({"ok": False, "error": "Account creation is already in progress"}, status=409)
 
