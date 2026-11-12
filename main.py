@@ -3648,6 +3648,33 @@ async def api_create_team(request):
     except Exception:
         return aiohttp.web.json_response({"ok": False, "error": "Unable to create team"})
 
+async def api_create_accounts(request):
+    """Create standalone guest accounts without attaching them to a clan/team."""
+    try:
+        body = await request.json()
+        region = str(body.get("region", "ME")).strip().upper()
+        count = body.get("count")
+        if region not in REGION_LANG:
+            return aiohttp.web.json_response({"ok": False, "error": "Invalid region"}, status=400)
+        if type(count) is not int or not 1 <= count <= 10:
+            return aiohttp.web.json_response({"ok": False, "error": "Quantity must be from 1 to 10"}, status=400)
+        if bot_state.creating:
+            return aiohttp.web.json_response({"ok": False, "error": "Account creation is already in progress"}, status=409)
+
+        bot_state.creating = True
+
+        async def create_standalone_accounts():
+            try:
+                await create_four_accounts(region, "", count, "AlZ3By")
+            except Exception:
+                print_error("Standalone account creation failed")
+                bot_state.creating = False
+
+        asyncio.create_task(create_standalone_accounts())
+        return aiohttp.web.json_response({"ok": True, "msg": f"creating {count} accounts", "count": count})
+    except Exception:
+        return aiohttp.web.json_response({"ok": False, "error": "Unable to start account creation"}, status=400)
+
 def _runtime_account_for_auth_uid(uid):
     uid = str(uid)
     game_id = bot_state.auth_to_game_id.get(uid)
@@ -4218,6 +4245,7 @@ async def start_web_server():
     app.router.add_post("/api/match-cycle/stop", api_match_cycle_stop)
     app.router.add_get("/api/account/export", api_account_export)
     app.router.add_post("/api/create_team", api_create_team)
+    app.router.add_post("/api/create_accounts", api_create_accounts)
     app.router.add_post("/api/account/add", api_account_add)
     app.router.add_post("/api/account/import", api_account_import)
     app.router.add_post("/api/account/delete", api_account_delete)
